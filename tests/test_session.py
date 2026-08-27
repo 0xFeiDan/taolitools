@@ -17,20 +17,23 @@ def test_disabled_is_crypto_24x7_even_on_weekend():
     assert status.entry_allowed and status.sampleable
 
 
-def test_stock_session_boundaries_and_only_regular_allows_entry():
+def test_stock_session_boundaries_are_all_tradable_regimes():
     clock = SessionClock(True)
-    assert clock.status(ts(2026, 8, 27, 3, 59)).session is MarketSession.CLOSED
+    overnight = clock.status(ts(2026, 8, 27, 3, 59))
     pre = clock.status(ts(2026, 8, 27, 4, 0))
     regular = clock.status(ts(2026, 8, 27, 9, 30))
     after = clock.status(ts(2026, 8, 27, 16, 0))
-    closed = clock.status(ts(2026, 8, 27, 20, 0))
-    assert pre.session is MarketSession.PRE_MARKET and not pre.entry_allowed
-    assert regular.session is MarketSession.REGULAR and regular.entry_allowed
-    assert after.session is MarketSession.AFTER_HOURS and not after.entry_allowed
-    assert closed.session is MarketSession.CLOSED and not closed.sampleable
+    night_open = clock.status(ts(2026, 8, 27, 20, 0))
+    assert overnight.session is MarketSession.OVERNIGHT
+    assert pre.session is MarketSession.PRE_MARKET
+    assert regular.session is MarketSession.REGULAR
+    assert after.session is MarketSession.AFTER_HOURS
+    assert night_open.session is MarketSession.OVERNIGHT
+    assert all(status.entry_allowed and status.sampleable for status in (
+        overnight, pre, regular, after, night_open))
 
 
-def test_weekend_and_equity_holidays_fail_closed():
+def test_weekend_and_equity_holidays_use_tradable_overnight_regime():
     clock = SessionClock(True)
     weekend = clock.status(ts(2026, 8, 29, 10, 0))
     independence_observed = clock.status(ts(2026, 7, 3, 10, 0))
@@ -38,8 +41,11 @@ def test_weekend_and_equity_holidays_fail_closed():
     assert weekend.reason == "weekend"
     assert independence_observed.reason == "holiday"
     assert good_friday.reason == "holiday"
-    assert not weekend.entry_allowed
-    assert not independence_observed.entry_allowed
+    assert weekend.session is MarketSession.OVERNIGHT
+    assert independence_observed.session is MarketSession.OVERNIGHT
+    assert good_friday.session is MarketSession.OVERNIGHT
+    assert weekend.entry_allowed and weekend.sampleable
+    assert independence_observed.entry_allowed and independence_observed.sampleable
 
 
 def test_new_york_dst_offsets_are_applied_without_system_tzdata():
@@ -51,13 +57,33 @@ def test_new_york_dst_offsets_are_applied_without_system_tzdata():
     assert winter.local_time.utcoffset() != summer.local_time.utcoffset()
 
 
-def test_published_early_close_stops_regular_entries_at_1300_et():
+def test_published_early_close_switches_to_tradable_after_hours_at_1300_et():
     clock = SessionClock(True)
     black_friday = clock.status(ts(2026, 11, 27, 13, 0, summer=False))
     christmas_eve = clock.status(ts(2026, 12, 24, 13, 0, summer=False))
     assert black_friday.session is MarketSession.AFTER_HOURS
     assert christmas_eve.session is MarketSession.AFTER_HOURS
-    assert not black_friday.entry_allowed and not christmas_eve.entry_allowed
+    assert black_friday.entry_allowed and black_friday.sampleable
+    assert christmas_eve.entry_allowed and christmas_eve.sampleable
+
+
+def test_overnight_has_no_friday_or_holiday_gap_for_perpetuals():
+    clock = SessionClock(True)
+    sunday_night = clock.status(ts(2026, 8, 30, 21, 0))
+    friday_night = clock.status(ts(2026, 8, 28, 21, 0))
+    friday_close = clock.status(ts(2026, 8, 28, 19, 59))
+    before_thanksgiving = clock.status(
+        ts(2026, 11, 25, 20, 0, summer=False))
+    thanksgiving_day = clock.status(
+        ts(2026, 11, 26, 10, 0, summer=False))
+    assert sunday_night.session is MarketSession.OVERNIGHT
+    assert friday_close.session is MarketSession.AFTER_HOURS
+    assert friday_night.session is MarketSession.OVERNIGHT
+    assert before_thanksgiving.session is MarketSession.OVERNIGHT
+    assert thanksgiving_day.session is MarketSession.OVERNIGHT
+    assert all(status.entry_allowed and status.sampleable for status in (
+        sunday_night, friday_close, friday_night, before_thanksgiving,
+        thanksgiving_day))
 
 
 def test_saturday_new_year_is_not_observed_on_preceding_friday():

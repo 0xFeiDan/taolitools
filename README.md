@@ -195,7 +195,7 @@ errors), credentials in `.env`, and the markets on the command line
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
 | `market_data.enforce_book_age` | enable millisecond book-age rejection | `true` in the example |
 | `market_data.max_book_age_ms` | reject new trades if either book is older | `300` |
-| `session.enabled` | `false`: crypto 24/7; `true`: US-stock regular-session entry gate | `false` |
+| `session.enabled` | `false`: one crypto 24/7 statistics pool; `true`: session-isolated stock-perpetual statistics | `false` |
 | `recorder.*` | minute-data recorder | on, `logs/minutes.csv` |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
@@ -227,16 +227,23 @@ session:
 ```
 
 Keep it `false` for crypto. Set it to `true` for stock perpetuals. Enabled mode
-uses US Eastern time and classifies pre-market, regular, after-hours, closed,
-weekends, standard US equity holidays, and recurring 13:00 ET early closes.
-Only the regular session permits OPEN/ADD. EXIT, emergency hedge, and emergency
-flatten remain available at all times.
+uses US Eastern time and has exactly four statistics regimes: overnight
+(20:00-04:00), pre-market, regular, and after-hours. Weekends and standard US
+equity holidays are assigned to the overnight pool because a stock perpetual
+can remain tradable while its cash reference market is closed. Recurring 13:00
+ET early closes switch from regular to after-hours. **Every regime may
+OPEN/ADD/EXIT** after its own Dynamic Midline has warmed up and the ordinary
+edge, freshness, cost, regime, and risk checks pass.
 
-Each sampleable session owns a separate Dynamic Midline, volatility, Z-score,
-and regime detector, so pre-market and after-hours observations cannot move the
-regular-session baseline. If a Pair is already open while a new session bank is
-warming up, EXIT may use the last ready baseline as a conservative risk-reducing
-fallback. The built-in core hours and calendar conventions follow the
+Every session owns a separate Dynamic Midline, volatility, Z-score, and regime
+detector, so overnight, pre-market, and after-hours observations cannot move
+the regular-session baseline. If a Pair is already open while a new session
+bank is warming up, EXIT may use the last ready baseline as a conservative
+risk-reducing fallback. New OPEN/ADD waits for that session's own warmup; that
+is estimator readiness, not a session trading ban. The 20:00 boundary is an
+intentional stock-perpetual statistics boundary that removes the cash-market
+20:00-21:00 gap; it is not a claim about cash-exchange hours. Calendar
+conventions otherwise follow the
 [NYSE trading-hours calendar](https://www.nyse.com/trade/hours-calendars).
 Unscheduled national closures and venue-specific oracle rules cannot be
 predicted by a static calendar; stale feeds and venue failures still fail

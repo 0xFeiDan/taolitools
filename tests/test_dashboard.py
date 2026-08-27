@@ -186,23 +186,24 @@ def test_renders_cost_pause_when_enabled_input_is_missing():
     assert "funding_stale:" in out
 
 
-def test_renders_stock_session_pause_and_market_session():
+def test_renders_stock_overnight_as_tradable_market_session():
     eng = make_engine()
     eng.entropy.set_book(99.9, 100.1)
     eng.hedge.set_book(99.9, 100.1)
     eng.cfg.session = replace(eng.cfg.session, enabled=True)
-    pre = SessionStatus(
-        MarketSession.PRE_MARKET, datetime.now(timezone.utc),
-        entry_allowed=False, sampleable=True)
-    eng.session_clock.status = lambda timestamp=None: pre
+    overnight = SessionStatus(
+        MarketSession.OVERNIGHT, datetime.now(timezone.utc),
+        entry_allowed=True, sampleable=True)
+    eng.session_clock.status = lambda timestamp=None: overnight
 
     out = render(eng)
-    assert "SESSION PAUSE" in out
+    assert "SESSION PAUSE" not in out
     assert "market session" in out
-    assert "pre_market" in out
+    assert "overnight" in out
 
     out_zh = render(eng, lang="zh")
-    assert "时段暂停" in out_zh and "市场时段" in out_zh
+    assert "时段暂停" not in out_zh
+    assert "市场时段" in out_zh and "夜盘" in out_zh
 
 
 def test_zh_stop_summary():

@@ -84,8 +84,12 @@ market_data:
   max_book_age_ms: 300
 
 # One switch only / 只需一个开关：
-# false = crypto 24/7; true = US stock perpetual, OPEN/ADD only in regular RTH.
-# false = 虚拟货币 24/7；true = 股票永续，仅美股正常交易时段允许开仓/加仓。
+# false = one crypto 24/7 statistics pool.
+# true = stock-perpetual session-aware statistics; every session can trade
+# after its own Dynamic Midline warm-up and normal risk/edge checks.
+# false = 虚拟货币共用一个 24/7 统计池。
+# true = 股票永续按盘前/正常/盘后/夜盘四个时段隔离统计；各时段完成独立预热并
+# 通过正常风控和可执行 edge 后，都可以开仓、加仓和退出。
 session:
   enabled: false
 

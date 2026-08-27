@@ -48,7 +48,6 @@ _ZH = {
     " WARMUP ": " 预热中 ",
     " REGIME PAUSE ": " 状态暂停 ",
     " COST PAUSE ": " 成本数据暂停 ",
-    " SESSION PAUSE ": " 时段暂停 ",
     " RECORDING ": " 采集中 ",
     " RUNNING ": " 运行中 ",
     "  up {t}": "  运行 {t}",
@@ -82,6 +81,12 @@ _ZH = {
     "Pair net PnL": "Pair 净盈亏",
     "cost inputs": "成本输入",
     "market session": "市场时段",
+    "crypto_24x7": "虚拟货币 24/7",
+    "pre_market": "盘前",
+    "regular": "正常时段",
+    "after_hours": "盘后",
+    "overnight": "夜盘",
+    "closed": "现货休市",
     "minute rows": "分钟数据行数",
     "{s}s ago": "{s} 秒前",
     "signal — executable premium vs full hurdle incl. fees (● = armed)":
@@ -250,8 +255,6 @@ class Dashboard:
             state = Text(self._t(" REGIME PAUSE "), style="bold white on red")
         elif (pause_reason or "").startswith("cost:"):
             state = Text(self._t(" COST PAUSE "), style="bold white on red")
-        elif (pause_reason or "").startswith("session:"):
-            state = Text(self._t(" SESSION PAUSE "), style="black on yellow")
         elif pause_reason in ("dynamic_warmup", "regime_warmup"):
             state = Text(self._t(" WARMUP "), style="black on yellow")
         elif stale:
@@ -349,7 +352,7 @@ class Dashboard:
                   style="bold red" if eng.consec_errors else "dim"))
         g.add_row(self._t("last exec"), Text(last, style="dim"))
         market_session = eng._activate_market_session()
-        session_text = market_session.session.value
+        session_text = self._t(market_session.session.value)
         if eng.cfg.session.enabled:
             session_text += " · " + market_session.local_time.strftime(
                 "%Y-%m-%d %H:%M ET")

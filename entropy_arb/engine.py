@@ -406,9 +406,7 @@ class Engine:
                 self._clear_transient_risk("regime_break")
 
     def strategy_pause_reason(self) -> Optional[str]:
-        session = self._activate_market_session()
-        if self.cfg.session.enabled and not session.entry_allowed:
-            return "session:" + session.session.value
+        self._activate_market_session()
         if self.cfg.midline.mode == "dynamic":
             if self.spread_stats is None or not self.spread_stats.ready:
                 return "dynamic_warmup"
@@ -1118,7 +1116,8 @@ class Engine:
         cfg = self.cfg
         self._update_spread_state(now)
         pause_reason = self.strategy_pause_reason()
-        if pause_reason in ("dynamic_warmup", "regime_warmup"):
+        if (pause_reason in ("dynamic_warmup", "regime_warmup")
+                and not self.pair_position.is_open):
             self._armed["sell_entropy"] = None
             self._armed["buy_entropy"] = None
             self._skiplog("new entries paused: %s", pause_reason)

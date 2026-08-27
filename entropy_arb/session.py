@@ -1,9 +1,9 @@
 """Optional US-equity session awareness.
 
-The feature is intentionally controlled by one switch.  Disabled means a
-24/7 crypto market.  Enabled means US Eastern equity sessions with entries
-allowed only during regular trading hours.  The clock is dependency-free so
-record-only and test installations remain lightweight.
+The feature is intentionally controlled by one switch. Disabled means one
+24/7 crypto statistics pool. Enabled classifies US stock-perpetual oracle
+regimes, but never blocks perpetual trading by itself: every session remains
+sampleable and entry-capable after its independent estimator is ready.
 """
 from __future__ import annotations
 
@@ -20,6 +20,9 @@ class MarketSession(str, Enum):
     PRE_MARKET = "pre_market"
     REGULAR = "regular"
     AFTER_HOURS = "after_hours"
+    OVERNIGHT = "overnight"
+    # Kept only so persisted historical Pair/session data remains readable.
+    # SessionClock no longer emits CLOSED for stock perpetuals.
     CLOSED = "closed"
 
 
@@ -139,7 +142,7 @@ def us_equity_early_closes(year: int) -> frozenset[date]:
 
 
 class SessionClock:
-    """Classify an instant as 24/7 crypto or a US equity session."""
+    """Classify an instant as 24/7 crypto or a stock-oracle regime."""
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
@@ -154,26 +157,32 @@ class SessionClock:
                 entry_allowed=True, sampleable=True)
 
         day = local.date()
+        minute = local.hour * 60 + local.minute
+        # This is a stock-perpetual liquidity/oracle classifier, not a cash
+        # exchange gate. Collapse every non-cash regime into OVERNIGHT so the
+        # strategy has exactly four independent statistics pools and no
+        # artificial 20:00-21:00 ET trading gap.
+        if minute >= 20 * 60 or minute < 4 * 60:
+            return SessionStatus(
+                MarketSession.OVERNIGHT, local, True, True, "off_cash_hours")
+
         if day.weekday() >= calendar.SATURDAY:
             return SessionStatus(
-                MarketSession.CLOSED, local, False, False, "weekend")
+                MarketSession.OVERNIGHT, local, True, True, "weekend")
         if day in us_equity_holidays(day.year):
             return SessionStatus(
-                MarketSession.CLOSED, local, False, False, "holiday")
+                MarketSession.OVERNIGHT, local, True, True, "holiday")
 
-        minute = local.hour * 60 + local.minute
         regular_close = (13 * 60 if day in us_equity_early_closes(day.year)
                          else 16 * 60)
         if 4 * 60 <= minute < 9 * 60 + 30:
             session = MarketSession.PRE_MARKET
         elif 9 * 60 + 30 <= minute < regular_close:
             session = MarketSession.REGULAR
-        elif regular_close <= minute < 20 * 60:
-            session = MarketSession.AFTER_HOURS
         else:
-            session = MarketSession.CLOSED
+            session = MarketSession.AFTER_HOURS
         return SessionStatus(
             session, local,
-            entry_allowed=session is MarketSession.REGULAR,
-            sampleable=session is not MarketSession.CLOSED,
-            reason=None if session is not MarketSession.CLOSED else "off_hours")
+            entry_allowed=True,
+            sampleable=True,
+            reason=None)

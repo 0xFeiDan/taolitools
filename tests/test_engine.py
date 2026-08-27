@@ -191,9 +191,8 @@ class FixedSessionClock:
         self.current = SessionStatus(
             session=session,
             local_time=datetime.now(timezone.utc),
-            entry_allowed=session in (
-                MarketSession.REGULAR, MarketSession.CRYPTO_24X7),
-            sampleable=session is not MarketSession.CLOSED)
+            entry_allowed=True,
+            sampleable=True)
 
     def status(self, timestamp=None):
         return self.current
@@ -272,15 +271,22 @@ def test_dynamic_warmup_blocks_then_zscore_ignores_static_bps_band():
     assert best[2].signal_action == "OPEN"
 
 
-def test_session_switch_is_off_for_crypto_and_blocks_stock_open_outside_rth():
+def test_session_switch_is_off_for_crypto_and_never_blocks_stock_perp_entry():
     eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
     set_premium(eng, 20.0)
     assert eng.strategy_pause_reason() is None
     assert run_scan(eng) is not None       # default crypto remains 24/7
 
     enable_stock_sessions(eng, MarketSession.PRE_MARKET)
-    assert eng.strategy_pause_reason() == "session:pre_market"
-    assert run_scan(eng) is None
+    assert eng.strategy_pause_reason() is None
+    assert run_scan(eng) is not None
+
+    for session in (MarketSession.OVERNIGHT, MarketSession.AFTER_HOURS):
+        eng.session_clock.set(session)
+        eng._activate_market_session()
+        eng._armed = {"sell_entropy": None, "buy_entropy": None}
+        assert eng.strategy_pause_reason() is None
+        assert run_scan(eng) is not None
 
     eng.session_clock.set(MarketSession.REGULAR)
     assert eng.strategy_pause_reason() is None
@@ -304,13 +310,20 @@ def test_dynamic_midline_samples_are_isolated_by_stock_session():
     assert regular_estimator is not pre_estimator
     approx(eng.spread_stats.slow_midline_bps, 20.0, 0.01)
 
+    eng.session_clock.set(MarketSession.OVERNIGHT)
+    set_premium(eng, -15.0)
+    eng._update_spread_state(now + 2.0, force=True)
+    overnight_estimator = eng.dynamic_midline
+    assert overnight_estimator not in (pre_estimator, regular_estimator)
+    approx(eng.spread_stats.slow_midline_bps, -15.0, 0.01)
+
     eng.session_clock.set(MarketSession.PRE_MARKET)
-    eng._activate_market_session(now + 2.0)
+    eng._activate_market_session(now + 3.0)
     assert eng.dynamic_midline is pre_estimator
     approx(eng.spread_stats.slow_midline_bps, 5.0, 0.01)
 
 
-def test_session_pause_still_allows_dynamic_pair_exit_during_warmup():
+def test_new_session_warmup_still_allows_dynamic_pair_exit():
     eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
     enable_dynamic(eng, min_samples=3, entry_z_score=2.5,
                    exit_z_score=0.5)
@@ -323,10 +336,21 @@ def test_session_pause_still_allows_dynamic_pair_exit_during_warmup():
 
     eng.session_clock.set(MarketSession.AFTER_HOURS)
     buy, sell, plan = run_scan(eng)
-    assert eng.strategy_pause_reason() == "session:after_hours"
+    assert eng.strategy_pause_reason() == "dynamic_warmup"
     assert buy.key == "entropy" and sell.key == "hedge"
     assert plan.signal_action == "EXIT"
     assert plan.pair_id == "ARB-SESSION-EXIT"
+
+
+def test_dynamic_overnight_can_open_after_its_own_stats_are_ready():
+    eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
+    enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
+    enable_stock_sessions(eng, MarketSession.OVERNIGHT)
+    set_ready_stats(eng, z_score=3.0)
+    buy, sell, plan = run_scan(eng)
+    assert eng.strategy_pause_reason() is None
+    assert buy.key == "hedge" and sell.key == "entropy"
+    assert plan.signal_action == "OPEN"
 
 
 def test_dynamic_flat_position_does_not_open_inside_entry_z():
