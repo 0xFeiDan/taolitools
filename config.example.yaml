@@ -20,7 +20,10 @@
 # Entropy 永远是其中一条腿；--hedge 选择对冲腿（三选一，见上表）。
 
 # ============================ THE SIGNAL / 信号 ============================
-# premium_bps = (Entropy price / hedge price - 1) * 10000
+# price_basis=usd (recommended):
+# premium_bps = (Entropy price * entropy quote/USD
+#                / (hedge price * hedge quote/USD) - 1) * 10000
+# price_basis=raw (legacy): (Entropy price / hedge price - 1) * 10000
 #
 # Static only / 仅 Static 模式：
 #   SELL entropy + BUY hedge   when executable premium >= midline + upper
@@ -33,7 +36,8 @@
 # the common price level, fills, funding, and quote/USD rates can move between
 # entry and exit.
 #
-# midline_bps is a number YOU derive from recorded data. Run the bot
+# midline_bps is a number YOU derive from recorded data in the same price_basis.
+# Run the bot
 # (--record-only) to collect logs/minutes.csv, then:  python3 tools/analyze.py
 #
 # midline_bps 是你根据采集数据设定的值。先运行机器人（--record-only）采集
@@ -42,6 +46,7 @@
 # 不保证固定美元利润；进出场之间的共同价格水平、成交、Funding 和 quote/USD
 # 汇率都可能变化。
 thresholds:
+  price_basis: usd      # Kraken-normalized; legacy configs default to raw
   midline_bps: 0.0     # persistent premium center / 溢价长期中枢
   upper_bps: 4.0       # entry above midline: sell entropy / 中枢上方入场带宽
   lower_bps: 4.0       # entry below midline: buy entropy / 中枢下方入场带宽

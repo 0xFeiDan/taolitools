@@ -59,6 +59,7 @@ def test_example_config_loads():
     assert cfg.stablecoin.provider == "kraken"
     assert cfg.stablecoin.source_url == "https://api.kraken.com"
     assert cfg.stablecoin.max_spread_bps == 10.0
+    assert cfg.threshold_price_basis == "usd"
     assert cfg.entropy.quote_asset == "USDC"
     assert cfg.hedge.quote_asset == "USDG"
     assert cfg.premium_persist_sec == 0.3
@@ -85,6 +86,7 @@ def test_minimal_defaults():
     assert cfg.regime.enabled is False
     assert cfg.market_data.enforce_book_age is False
     assert cfg.session.enabled is False       # crypto remains 24/7 by default
+    assert cfg.threshold_price_basis == "raw"  # backward-compatible configs
 
 
 def test_v2_config_contract():
@@ -189,6 +191,18 @@ def test_nonpositive_band():
     expect_error("thresholds:\n"
                  "  midline_bps: 5\n  upper_bps: 0\n  lower_bps: 3\n",
                  "must be > 0")
+
+
+def test_threshold_price_basis_is_validated():
+    usd = MINIMAL.replace("thresholds:\n", "thresholds:\n  price_basis: usd\n")
+    usd_enabled = (usd + "\nsizing:\n  vwap_enabled: true\n"
+                   "stablecoin:\n  enabled: true\n")
+    cfg = load(usd_enabled)
+    assert cfg.threshold_price_basis == "usd"
+    bad = MINIMAL.replace("thresholds:\n", "thresholds:\n  price_basis: usdt\n")
+    expect_error(bad,
+                 "price_basis")
+    expect_error(usd, "stablecoin.enabled")
 
 
 def test_all_numeric_config_values_must_be_finite():

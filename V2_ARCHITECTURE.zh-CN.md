@@ -137,14 +137,17 @@ Entropy 便宜：买入 Entropy + 卖出 hedge venue
 
 ## 5. 价差定义
 
-统计层使用两边中间价计算 Entropy 相对对冲腿的溢价：
+统计层按 `thresholds.price_basis` 计算 Entropy 相对对冲腿的溢价。推荐的
+`usd` 模式使用：
 
 ```text
 premium_bps
-  = (Entropy mid / Hedge mid - 1) × 10,000
+  = (Entropy mid × Entropy quote/USD
+     / (Hedge mid × Hedge quote/USD) - 1) × 10,000
 ```
 
-该价差用于 Midline、波动率、Z-score 和 Regime 统计，不等于最终可成交利润。
+`raw` 模式保留旧公式和旧配置兼容性。选定的同一口径用于 Midline、波动率、
+Z-score、Regime 和方向门槛；USD 汇率不会被重复换算。该价差不等于最终可成交利润。
 
 真正下单前使用的是：
 
@@ -983,6 +986,7 @@ P50 / P95 / P99 / max
 
 | 配置 | 作用 |
 |---|---|
+| `thresholds.price_basis` | `usd` 统一换算后统计与交易；`raw` 兼容旧配置 |
 | `thresholds.midline_bps` | Static 中枢；Dynamic 预热显示种子 |
 | `thresholds.upper_bps` | Static 上方带宽 |
 | `thresholds.lower_bps` | Static 下方带宽 |
@@ -1137,7 +1141,7 @@ Copy-Item config.example.yaml config.yaml
 
 | 文件 | 内容 |
 |---|---|
-| `logs/minutes.csv` | 分钟级盘口统计 |
+| `logs/minutes.csv` | raw 与 USD 双口径分钟盘口统计、quote/USD、basis 和有效样本数 |
 | `logs/trades.csv` | 每次执行计划、VWAP、成本、时段和成交结果 |
 | `logs/pair-ledger.jsonl` | 追加式 Pair 审计事件 |
 | `logs/runtime-state.json` | 重启恢复状态 |

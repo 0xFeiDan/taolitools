@@ -35,6 +35,11 @@ shown below. **Dynamic** uses the rolling Slow Midline plus Z-score
 OPEN/ADD/EXIT rules described later.
 
 ```
+price_basis: usd (recommended)
+premium_bps = (Entropy price × Entropy quote/USD
+               / (hedge price × hedge quote/USD) − 1) × 10 000
+
+price_basis: raw (legacy)
 premium_bps = (Entropy price / hedge price − 1) × 10 000
 
                           ┌──────────────  SELL entropy + BUY hedge
@@ -46,6 +51,8 @@ midline − lower  ────────────────────�
                           └──────────────  BUY entropy + SELL hedge
 ```
 
+- `price_basis` — `usd` keeps collection, Midline, Z-score, Regime, VWAP and
+  thresholds in one normalized unit. Omitted legacy configs retain `raw`.
 - `midline_bps` — the Static premium center and Dynamic warm-up display seed.
   Cross-venue premiums are
   rarely centered at zero (different oracles, different quote assets, listing
@@ -62,8 +69,8 @@ Entropy/Hedge = 100.091/100 and later closing at 1000/999.801 satisfies both
 directional hurdles but loses about $0.108 before fees: the common price level
 rose tenfold. Slippage, funding, and quote/USD changes can reduce it further.
 
-One Static-mode consequence worth understanding: with `midline_bps: 5`, the raw
-lower boundary is `midline − lower`. The executable BUY-entropy direction uses
+One Static-mode consequence worth understanding: with `midline_bps: 5`, the
+lower boundary is `midline − lower` in the configured basis. The executable BUY-entropy direction uses
 the exact reciprocal hedge/Entropy ratio (not merely `lower − midline`), which
 can still be **negative**. That is intentional —
 if entropy is persistently 5 bps rich, buying it at a 0 bps premium is 5 bps
@@ -117,7 +124,9 @@ python3 tools/analyze.py
 ```
 
 It prints the premium distribution, how often each candidate band would have
-fired, and a ready-to-paste `thresholds:` block for `config.yaml`.
+fired, and a ready-to-paste `thresholds:` block for `config.yaml`. It defaults
+to USD-normalized samples and emits `price_basis: usd`; use `--basis raw` only
+for legacy configurations.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -158,8 +167,18 @@ Once per second it samples both live books; once per minute it writes a row:
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |
 | `buy_edge_mean/max_bps` | executable premium for BUY entropy (hedge bid / entropy ask − 1) |
 | `samples` | how many of the ~60 seconds both books were fresh |
+| `entropy_quote_asset`, `hedge_quote_asset` | quote-asset identities used for the row |
+| `entropy_quote_usd_close`, `hedge_quote_usd_close` | last fresh Kraken quote/USD midpoint |
+| `hedge_entropy_quote_basis_close_bps` | hedge quote / Entropy quote basis; USDG/USDC for Lighter RH |
+| `premium_usd_*_bps` | mid premium after both legs are converted to USD |
+| `sell_edge_usd_*_bps`, `buy_edge_usd_*_bps` | executable directional edges in USD |
+| `fx_samples` | subset of book samples with fresh quote/USD rates |
 
-Recorded edges are pre-fee; the analyzer subtracts `--fees-bps` (pass the
+Raw fields are retained even when FX is missing, but USD fields remain blank
+and `fx_samples` is zero; parity is never fabricated. A pre-existing CSV with
+the old header is rotated to `.old`, because its missing historical FX cannot
+be reconstructed safely. Recorded edges are pre-fee; the analyzer defaults to
+the USD fields and subtracts `--fees-bps` (pass the
 **sum** of both venues' taker fees — default 0.0 for the zero-fee venues,
 ~1.0 with a `tradexyz` hedge) before counting firings, so its table and
 suggestions translate directly into config values. `--hours 24` restricts to
@@ -175,6 +194,7 @@ errors), credentials in `.env`, and the markets on the command line
 
 | key | meaning | default |
 |---|---|---|
+| `thresholds.price_basis` | `usd` for normalized signals; `raw` preserves legacy semantics | `raw` (example: `usd`) |
 | `thresholds.midline_bps` | premium center (measure it!) | — |
 | `thresholds.upper_bps` / `lower_bps` | entry bands (> 0) | — |
 | `midline.mode` | `static` or live `dynamic` slow-median baseline | `dynamic` in the example |

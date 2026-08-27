@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Analyze recorded minute data and suggest config.yaml thresholds.
 
-Reads the CSV written by the built-in recorder (logs/minutes.csv by default)
-and prints:
+Reads the CSV written by the built-in recorder (logs/minutes.csv by default).
+USD-normalized fields are the safe default; ``--basis raw`` is retained only
+for legacy configs and raw-data diagnostics. It prints:
 
   * the premium distribution (midline candidates),
   * how often each candidate upper/lower band would have fired,
@@ -38,22 +39,43 @@ def pctl(sorted_vals: list, q: float) -> float:
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
 
 
-def load_rows(path: str, hours: float, min_samples: int) -> list:
+def load_rows(path: str, hours: float, min_samples: int,
+              basis: str = "usd") -> list:
+    if basis not in ("usd", "raw"):
+        raise ValueError("basis must be 'usd' or 'raw'")
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
+    prefix = "_usd" if basis == "usd" else ""
+    sample_key = "fx_samples" if basis == "usd" else "samples"
     rows = []
     with open(path, newline="") as fh:
-        for r in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        required = {
+            "minute_ts", sample_key,
+            f"premium{prefix}_close_bps",
+            f"premium{prefix}_mean_bps",
+            f"sell_edge{prefix}_max_bps",
+            f"buy_edge{prefix}_max_bps",
+        }
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            hint = ("; old CSVs cannot provide historical FX — use "
+                    "--basis raw or collect a new file"
+                    if basis == "usd" else "")
+            raise ValueError(
+                f"CSV is missing required {basis} fields: "
+                f"{', '.join(sorted(missing))}{hint}")
+        for r in reader:
             try:
                 if float(r["minute_ts"]) < cutoff:
                     continue
-                if int(r["samples"]) < min_samples:
+                if int(r[sample_key]) < min_samples:
                     continue
                 parsed = {
                     "ts": float(r["minute_ts"]),
-                    "prem": float(r["premium_close_bps"]),
-                    "prem_mean": float(r["premium_mean_bps"]),
-                    "sell_max": float(r["sell_edge_max_bps"]),
-                    "buy_max": float(r["buy_edge_max_bps"]),
+                    "prem": float(r[f"premium{prefix}_close_bps"]),
+                    "prem_mean": float(r[f"premium{prefix}_mean_bps"]),
+                    "sell_max": float(r[f"sell_edge{prefix}_max_bps"]),
+                    "buy_max": float(r[f"buy_edge{prefix}_max_bps"]),
                 }
                 if all(math.isfinite(value) for value in parsed.values()):
                     rows.append(parsed)
@@ -75,13 +97,15 @@ def main() -> None:
                         "pays both legs); recorded edges are pre-fee, so this "
                         "is subtracted before counting firings (default 0.0 — "
                         "pass ~1.0 with a tradexyz hedge)")
+    p.add_argument("--basis", choices=("usd", "raw"), default="usd",
+                   help="analyze USD-normalized fields (default) or legacy "
+                        "raw quote-unit fields")
     args = p.parse_args()
 
     try:
-        rows = load_rows(args.csv, args.hours, args.min_samples)
-    except FileNotFoundError:
-        print(f"{args.csv} not found — run the bot (even --record-only) to "
-              f"collect data first / 未找到数据文件，请先运行机器人采集数据",
+        rows = load_rows(args.csv, args.hours, args.min_samples, args.basis)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"cannot analyze {args.csv}: {exc} / 无法分析该数据文件",
               file=sys.stderr)
         sys.exit(1)
     if len(rows) < 30:
@@ -98,7 +122,8 @@ def main() -> None:
     median = pctl(prem, 50)
 
     print(f"\n=== {args.csv}: {len(rows)} minutes over {span_h:.1f}h ===\n")
-    print("premium of Entropy over hedge, minute close (bps) / "
+    print(f"premium of Entropy over hedge, {args.basis.upper()} basis, "
+          "minute close (bps) / "
           "Entropy 相对对冲腿的溢价:")
     print(f"  mean {mean:+.2f}   std {math.sqrt(var):.2f}   "
           f"median {median:+.2f}")
@@ -140,6 +165,7 @@ distances, not a guaranteed USD round-trip profit floor. /
 {fees:.1f} bps 手续费）。带宽是信号距离，不保证往返美元利润下限：
 
 thresholds:
+  price_basis: {args.basis}
   midline_bps: {midline}
   upper_bps: {sug_upper}
   lower_bps: {sug_lower}

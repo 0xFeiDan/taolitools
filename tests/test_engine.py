@@ -282,6 +282,26 @@ def test_usdg_basis_normalizes_the_midline_hurdle_in_both_directions():
     approx(buy_hurdle, expected_buy)
 
 
+def test_usd_threshold_basis_is_not_converted_twice_and_drives_stats():
+    eng = make_engine(midline=0.0, upper=4.0, lower=4.0)
+    enable_vwap(eng, minimum_net_edge_bps=1.0)
+    eng.cfg.threshold_price_basis = "usd"
+    eng.costs.stablecoin_enabled = True
+    eng.costs.set_quote_usd("USDC", 1.0)
+    eng.costs.set_quote_usd("USDG", 0.999)
+    approx(eng._vwap_required_net_edge(eng.hedge, eng.entropy), 4.0)
+    reverse = (1.0 / (1.0 - 4.0 / 1e4) - 1.0) * 1e4
+    approx(eng._vwap_required_net_edge(eng.entropy, eng.hedge), reverse)
+
+    # Raw Entropy/USDG is -10 bps, but both legs are exactly flat in USD.
+    set_premium(eng, -10.0)
+    approx(eng.premium_bps(), 0.0, 0.02)
+    enable_dynamic(eng, min_samples=1)
+    eng._update_spread_state(time.time(), force=True)
+    assert eng.spread_stats is not None
+    approx(eng.spread_stats.spread_bps, 0.0, 0.02)
+
+
 def test_dynamic_warmup_blocks_then_zscore_ignores_static_bps_band():
     eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
     enable_dynamic(eng, min_samples=3)

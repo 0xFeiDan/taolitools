@@ -722,8 +722,18 @@ class Engine:
         for v in self.venues.values():
             tasks += v.start_tasks(self.stop, self._update_evt.set, live)
         if cfg.recorder_enabled or self.record_only:
+            rate_getter = (self.costs.fresh_quote_rate
+                           if cfg.stablecoin.enabled
+                           or (cfg.entropy.quote_asset == "USD"
+                               and cfg.hedge.quote_asset == "USD")
+                           else None)
             self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
-                                           self.hedge.book, cfg.staleness_sec)
+                                           self.hedge.book, cfg.staleness_sec,
+                                           quote_rate_getter=rate_getter,
+                                           entropy_quote_asset=(
+                                               cfg.entropy.quote_asset),
+                                           hedge_quote_asset=(
+                                               cfg.hedge.quote_asset))
             tasks.append(asyncio.create_task(self.recorder.run(self.stop),
                                              name="recorder"))
         if cfg.midline.mode == "dynamic" or cfg.regime.enabled:
@@ -871,11 +881,11 @@ class Engine:
 
     def _directional_midline_usd(self, buy, sell,
                                  entropy_midline_bps: float) -> float:
-        """Convert the Entropy/hedge raw midline into this leg direction.
+        """Convert the configured Entropy/hedge basis into this leg direction.
 
         The reverse direction is a reciprocal, not simply ``-midline``. Quote
-        assets are then converted to USD so a USDG/USDC basis cannot shift the
-        executable edge while leaving the hurdle in raw quote units.
+        assets are converted exactly once for legacy ``raw`` thresholds;
+        ``usd`` thresholds are already normalized by the recorder/analyzer.
         """
         entropy_hedge_ratio = 1.0 + entropy_midline_bps / 1e4
         if (not math.isfinite(entropy_hedge_ratio)
@@ -884,8 +894,10 @@ class Engine:
         raw_direction_ratio = (entropy_hedge_ratio
                                if sell.key == "entropy"
                                else 1.0 / entropy_hedge_ratio)
-        adjusted_ratio = (raw_direction_ratio * self._quote_rate(sell)
-                          / self._quote_rate(buy))
+        adjusted_ratio = raw_direction_ratio
+        if self.cfg.threshold_price_basis == "raw":
+            adjusted_ratio *= (self._quote_rate(sell)
+                               / self._quote_rate(buy))
         return (adjusted_ratio - 1.0) * 1e4
 
     def _vwap_required_net_edge(self, buy, sell) -> float:
@@ -2550,7 +2562,14 @@ class Engine:
         em, hm = self.entropy.book.mid(), self.hedge.book.mid()
         if not (em and hm):
             return None
-        return (em / hm - 1.0) * 1e4
+        ratio = em / hm
+        if self.cfg.threshold_price_basis == "usd":
+            try:
+                ratio *= (self.costs.fresh_quote_rate("entropy")
+                          / self.costs.fresh_quote_rate("hedge"))
+            except KeyError:
+                return None
+        return (ratio - 1.0) * 1e4
 
     async def _status_loop(self) -> None:
         cfg = self.cfg

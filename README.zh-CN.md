@@ -33,6 +33,11 @@ CSV 数据**，配套分析工具提供 Static 或 Dynamic 信号配置所需的
 Slow Midline 和后文说明的 Z-score OPEN/ADD/EXIT：
 
 ```
+price_basis: usd（推荐）
+premium_bps =（Entropy 价格 × Entropy 计价币/USD
+               /（对冲腿价格 × 对冲腿计价币/USD）− 1）× 10 000
+
+price_basis: raw（旧配置兼容）
 premium_bps =（Entropy 价格 / 对冲腿价格 − 1）× 10 000
 
                           ┌──────────────  卖出 Entropy + 买入对冲腿
@@ -44,6 +49,8 @@ midline − lower  ────────────────────�
                           └──────────────  买入 Entropy + 卖出对冲腿
 ```
 
+- `price_basis` —— `usd` 让采集、Midline、Z-score、Regime、VWAP 和门槛使用
+  同一 USD 口径；旧配置省略时继续使用 `raw`。
 - `midline_bps` —— Static 溢价中枢，也是 Dynamic 预热期的显示种子。跨所溢价
   几乎从不以零为中心（预言机不同、
   计价货币不同、新上市溢价等），零中心的带只会朝一个方向开仓、打满仓位上限、
@@ -58,7 +65,7 @@ Static 模式下，两个方向的门槛都作用于**可实际成交的价格**
 `1000/999.801` 反向退出；两个方向都通过门槛，但未计手续费已亏约 `$0.108`。
 滑点、Funding 和 quote/USD 变化还会进一步改变结果。
 
-Static 模式有一点必须理解：当 `midline_bps: 5` 时，原始下边界是
+Static 模式有一点必须理解：当 `midline_bps: 5` 时，所选口径的下边界是
 `midline − lower`；实际 BUY-Entropy 方向会换算成精确的 Hedge/Entropy 倒数，
 而不是简单使用 `lower − midline`，换算后的门槛仍可能为**负数**。这是有意为之——如果 Entropy 长期贵 5 bps，
 那么在溢价为 0 时买入它，相对其自身均衡水平就是便宜了 5 bps，这笔交易正是
@@ -108,7 +115,8 @@ python3 tools/analyze.py
 ```
 
 它会输出溢价分布、各档带宽的历史触发频率，以及可直接粘贴进
-`config.yaml` 的 `thresholds:` 配置块。
+`config.yaml` 的 `thresholds:` 配置块。默认分析 USD 换算后的样本并输出
+`price_basis: usd`；`--basis raw` 只用于兼容旧配置和检查原始数据。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -148,8 +156,16 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `sell_edge_mean/max_bps` | 卖出 Entropy 方向的可成交溢价（Entropy 买一 / 对冲腿卖一 − 1） |
 | `buy_edge_mean/max_bps` | 买入 Entropy 方向的可成交溢价（对冲腿买一 / Entropy 卖一 − 1） |
 | `samples` | 该分钟约 60 秒中两边盘口同时有效的秒数 |
+| `entropy_quote_asset`, `hedge_quote_asset` | 本行两腿计价资产身份 |
+| `entropy_quote_usd_close`, `hedge_quote_usd_close` | Kraken 最新有效 quote/USD 中间价 |
+| `hedge_entropy_quote_basis_close_bps` | 对冲计价币/Entropy 计价币基差；Lighter RH 即 USDG/USDC |
+| `premium_usd_*_bps` | 两腿换算 USD 后的中间价溢价 |
+| `sell_edge_usd_*_bps`, `buy_edge_usd_*_bps` | USD 口径的两方向可执行 edge |
+| `fx_samples` | 同时具有新鲜 quote/USD 的盘口样本数 |
 
-采集的 edge 为费前口径；分析工具在统计触发频率前会先扣除 `--fees-bps`
+FX 缺失时仍保留 raw 字段，但 USD 字段留空且 `fx_samples=0`，绝不伪造 1:1。
+旧表头 CSV 会轮换为 `.old`，因为缺失的历史 FX 无法安全重建。采集的 edge 为
+费前口径；分析工具默认使用 USD 字段，并在统计触发频率前扣除 `--fees-bps`
 （请传入**两边吃单费之和**——零费交易所默认 0.0，对冲腿为 `tradexyz` 时
 约为 1.0），因此其表格与建议值可直接填入配置。`--hours 24`
 可只分析最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
@@ -162,6 +178,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 
 | 键 | 含义 | 默认值 |
 |---|---|---|
+| `thresholds.price_basis` | `usd` 使用统一美元信号；`raw` 保持旧语义 | 默认 `raw`，示例为 `usd` |
 | `thresholds.midline_bps` | 静态溢价中枢（必须实测！） | — |
 | `thresholds.upper_bps` / `lower_bps` | 入场带宽（> 0） | — |
 | `midline.mode` | `static` 或实时 `dynamic` 慢速中位数中枢 | `dynamic`（示例配置） |

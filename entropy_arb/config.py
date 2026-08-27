@@ -9,7 +9,11 @@ is an error rather than a setting that silently does nothing.
 
 Threshold model (fixed numbers the user derives from recorded minute data):
 
-    premium_bps = (entropy_price / hedge_price - 1) * 10_000
+    price_basis=usd:
+        premium_bps = (entropy_price * entropy_quote_usd
+                       / (hedge_price * hedge_quote_usd) - 1) * 10_000
+    price_basis=raw (legacy default):
+        premium_bps = (entropy_price / hedge_price - 1) * 10_000
 
     SELL entropy / BUY hedge  fires when the executable premium
         (entropy bid over hedge ask) >= midline_bps + upper_bps
@@ -218,6 +222,7 @@ class Config:
     midline_bps: float
     upper_bps: float
     lower_bps: float
+    threshold_price_basis: str
     # sizing
     take_fraction: float
     max_order_notional: float
@@ -299,6 +304,7 @@ _SCHEMA: Dict[str, Any] = {
         "midline_bps": float,
         "upper_bps": float,
         "lower_bps": float,
+        "price_basis": str,
     },
     "midline": {
         "mode": str,
@@ -543,6 +549,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                               f"数据计算后填入")
     upper = _positive(thr["upper_bps"], "thresholds.upper_bps")
     lower = _positive(thr["lower_bps"], "thresholds.lower_bps")
+    threshold_price_basis = _choice(
+        thr.get("price_basis", "raw"), ("raw", "usd"),
+        "thresholds.price_basis")
     _at_most(upper, MAX_CONFIG_BPS, "thresholds.upper_bps")
     _at_most(lower, MAX_CONFIG_BPS, "thresholds.lower_bps")
     static_midline = float(thr["midline_bps"])
@@ -829,6 +838,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if (funding.enabled or stablecoin.enabled) and not vwap_sizing.enabled:
         raise ConfigError("funding/stablecoin cost modeling requires "
                           "sizing.vwap_enabled: true")
+    if threshold_price_basis == "usd" and not stablecoin.enabled:
+        raise ConfigError("thresholds.price_basis: usd requires "
+                          "stablecoin.enabled: true")
 
     for value, path in (
         (premium_persist_sec, "execution.premium_persist_sec"),
@@ -952,6 +964,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         midline_bps=static_midline,
         upper_bps=upper,
         lower_bps=lower,
+        threshold_price_basis=threshold_price_basis,
         take_fraction=take_fraction,
         max_order_notional=max_order_notional,
         min_order_notional=min_order_notional,
