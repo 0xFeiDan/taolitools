@@ -730,6 +730,10 @@ class Engine:
             self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
                                            self.hedge.book, cfg.staleness_sec,
                                            quote_rate_getter=rate_getter,
+                                           quote_pair_getter=(
+                                               self.costs.fresh_quote_pair
+                                               if cfg.stablecoin.enabled
+                                               else None),
                                            entropy_quote_asset=(
                                                cfg.entropy.quote_asset),
                                            hedge_quote_asset=(
@@ -896,8 +900,12 @@ class Engine:
                                else 1.0 / entropy_hedge_ratio)
         adjusted_ratio = raw_direction_ratio
         if self.cfg.threshold_price_basis == "raw":
-            adjusted_ratio *= (self._quote_rate(sell)
-                               / self._quote_rate(buy))
+            try:
+                buy_rate, sell_rate = self.costs.directional_quote_rates(
+                    buy_key=buy.key, sell_key=sell.key)
+            except KeyError:
+                buy_rate = sell_rate = 1.0
+            adjusted_ratio *= sell_rate / buy_rate
         return (adjusted_ratio - 1.0) * 1e4
 
     def _vwap_required_net_edge(self, buy, sell) -> float:
@@ -953,8 +961,9 @@ class Engine:
                 sell_funding_rate = (
                     self.costs.funding_rate(sell.key)
                     if action is not SignalAction.EXIT else None)
-                buy_quote_usd = self.costs.quote_rate(buy.key)
-                sell_quote_usd = self.costs.quote_rate(sell.key)
+                buy_quote_usd, sell_quote_usd = (
+                    self.costs.directional_quote_rates(
+                        buy_key=buy.key, sell_key=sell.key))
             except KeyError:
                 # Missing enabled cost data already blocks OPEN/ADD via
                 # strategy_pause_reason. EXIT remains available for safety.
@@ -1313,8 +1322,9 @@ class Engine:
                               self.ledger.current.remaining_base)
                 if matched > 0:
                     try:
-                        buy_quote = self.costs.quote_rate(buy_v.key)
-                        sell_quote = self.costs.quote_rate(sell_v.key)
+                        buy_quote, sell_quote = (
+                            self.costs.directional_quote_rates(
+                                buy_key=buy_v.key, sell_key=sell_v.key))
                     except KeyError:
                         buy_quote = sell_quote = 1.0
                     raw_ratio = sell_px / buy_px
@@ -2125,8 +2135,9 @@ class Engine:
         if not accounting_complete:
             pair.accounting_complete = False
         try:
-            buy_quote_usd = self.costs.quote_rate(buy.key)
-            sell_quote_usd = self.costs.quote_rate(sell.key)
+            buy_quote_usd, sell_quote_usd = (
+                self.costs.directional_quote_rates(
+                    buy_key=buy.key, sell_key=sell.key))
         except KeyError:
             buy_quote_usd = sell_quote_usd = 1.0
         common = {

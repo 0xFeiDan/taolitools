@@ -128,44 +128,54 @@ def test_funding_uses_each_legs_actual_usd_notional():
     assert abs(edge.expected_net_profit_usd - expected_profit) < 1e-12
 
 
-def test_kraken_stablecoin_books_set_real_usd_rates_atomically():
+def test_kraken_direct_usdg_usdc_book_preserves_executable_sides():
     now = time.time()
     session = FakeSession([
         FakeResponse(kraken_book(
             "USDCUSD", 0.9998, 1.0, bid_ts=now - 2, ask_ts=now - 1)),
         FakeResponse(kraken_book(
-            "USDGUSD", 1.0000, 1.0002, bid_ts=now - 3, ask_ts=now - 2)),
+            "USDGUSDC", 1.0000, 1.0010,
+            bid_ts=now - 600, ask_ts=now - 300)),
     ])
     costs = monitor(funding_enabled=False)
 
+    before = time.time()
     asyncio.run(costs.refresh_stablecoins(
         session, "https://api.kraken.com"))
 
     assert costs.quote_usd["USDC"].value == pytest.approx(0.9999)
-    assert costs.quote_usd["USDG"].value == pytest.approx(1.0001)
-    assert costs.quote_usd["USDC"].observed_at == pytest.approx(now - 2)
-    assert costs.quote_usd["USDG"].observed_at == pytest.approx(now - 3)
+    assert costs.quote_usd["USDG"].value == pytest.approx(
+        0.9999 * 1.0005)
+    assert costs.quote_usd["USDC"].observed_at >= before
+    assert costs.quote_usd["USDG"].observed_at >= before
+    assert costs.fresh_quote_pair("USDG", "USDC") == pytest.approx(
+        (1.0, 1.001))
     assert all(request[1]["params"]["count"] == "1"
                for request in session.requests)
     assert [request[1]["params"]["pair"] for request in session.requests] == [
-        "USDCUSD", "USDGUSD"]
-    basis = (1.0001 / 0.9999 - 1.0) * 1e4
+        "USDCUSD", "USDGUSDC"]
+    # BUY hedge spends USDG at the cross ask; SELL hedge receives the bid.
+    assert costs.directional_quote_rates(
+        buy_key="hedge", sell_key="entropy") == pytest.approx(
+            (1.001 * 0.9999, 0.9999))
+    assert costs.directional_quote_rates(
+        buy_key="entropy", sell_key="hedge") == pytest.approx(
+            (0.9999, 1.0 * 0.9999))
     assert costs.stablecoin_basis_cost_bps(
-        buy_key="entropy", sell_key="hedge") == pytest.approx(-basis)
+        buy_key="hedge", sell_key="entropy") == pytest.approx(
+            (1.0 - 1.0 / 1.001) * 1e4)
 
 
 @pytest.mark.parametrize("bad_payload", [
     {"error": ["EQuery:Unknown asset pair"], "result": {}},
     kraken_book("WRONGPAIR", 0.9999, 1.0,
                 bid_ts=time.time(), ask_ts=time.time()),
-    kraken_book("USDGUSD", 1.0002, 1.0,
+    kraken_book("USDGUSDC", 1.0002, 1.0,
                 bid_ts=time.time(), ask_ts=time.time()),
-    kraken_book("USDGUSD", "NaN", 1.0,
+    kraken_book("USDGUSDC", "NaN", 1.0,
                 bid_ts=time.time(), ask_ts=time.time()),
-    kraken_book("USDGUSD", 0.99, 1.01,
+    kraken_book("USDGUSDC", 0.99, 1.01,
                 bid_ts=time.time(), ask_ts=time.time()),
-    kraken_book("USDGUSD", 0.9999, 1.0,
-                bid_ts=time.time() - 61, ask_ts=time.time()),
 ])
 def test_kraken_stablecoin_refresh_rejects_unsafe_book_without_partial_update(
         bad_payload):
@@ -183,3 +193,21 @@ def test_kraken_stablecoin_refresh_rejects_unsafe_book_without_partial_update(
     assert "USDC" not in costs.quote_usd
     assert "USDG" not in costs.quote_usd
     assert costs.pause_reason() == "stablecoin_stale:USDC"
+
+
+def test_exact_ten_bps_direct_cross_is_accepted_despite_old_resting_levels():
+    now = time.time()
+    session = FakeSession([
+        FakeResponse(kraken_book(
+            "USDCUSD", 0.9999, 1.0, bid_ts=now - 500, ask_ts=now - 400)),
+        FakeResponse(kraken_book(
+            "USDGUSDC", 1.0, 1.001, bid_ts=now - 3600,
+            ask_ts=now - 1800)),
+    ])
+    costs = monitor(funding_enabled=False)
+
+    asyncio.run(costs.refresh_stablecoins(
+        session, "https://api.kraken.com"))
+
+    assert costs.fresh_quote_pair("USDG", "USDC") == pytest.approx(
+        (1.0, 1.001))

@@ -385,12 +385,14 @@ adjusted gross edge
   - buy VWAP  × buy quote/USD
 ```
 
-The example reads level-1 `ASSET/USD` books from Kraken's public REST API,
-including the actual Paxos USDG used by Lighter Robinhood. Bitget's similarly
-named USDGO is a different Anchorage Digital/OSL asset and must not be used as
-a proxy. Rates are committed only when every required book has a finite,
-positive, non-crossed, current level with spread at or below
-`max_spread_bps`; otherwise prior timestamps are retained and become stale.
+The example reads the `USDC/USD` anchor and direct `USDG/USDC` level-1 book
+from Kraken's public REST API, using the actual Paxos USDG used by Lighter
+Robinhood. Bitget's similarly named USDGO is a different Anchorage Digital/OSL
+asset and must not be used as a proxy. Rates are committed only when every
+required book is finite, positive, non-crossed, and has spread at or below
+`max_spread_bps`. REST receipt time determines snapshot freshness; an unchanged
+resting level is not mistaken for a stale API response. Otherwise prior
+timestamps are retained and become stale.
 A missing or stale source blocks OPEN/ADD. `warning_deviation_bps` is observable; crossing
 `halt_deviation_bps` pauses new exposure. Set each venue's `quote_asset`
 correctly; the defaults are USDC for Entropy/Lighter mainnet/trade.xyz and USDG
@@ -401,11 +403,13 @@ refuses non-USD quote assets unless fresh stablecoin conversion is enabled.
 Account/session PnL is reported as unavailable once that conversion is stale;
 an old USDG/USDC rate is never presented as current USD value.
 
-The reference USDG/USDC quote basis is derived from the two real USD rates
-(the execution cost field applies a direction-dependent sign):
+The USDG/USDC basis uses the direct cross midpoint. Executable conversion uses
+the ask when buying USDG and the bid when selling USDG. The minute CSV also
+records `hedge_entropy_quote_bid_close`, `hedge_entropy_quote_ask_close`, and
+`hedge_entropy_quote_spread_close_bps`:
 
 ```text
-USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10,000
+USDG/USDC basis bps = ((bid + ask) / 2 - 1) * 10,000
 ```
 
 ## Credentials (`.env`, live only)

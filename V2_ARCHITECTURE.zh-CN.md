@@ -598,14 +598,15 @@ stablecoin:
   halt_deviation_bps: 30
 ```
 
-系统读取 Kraken `ASSET/USD` 一档盘口中间价，将每条腿独立换算成 USD。USDG
-指 Lighter Robinhood 使用的 Paxos USDG；Bitget USDGO 是不同资产，不得替代。
-盘口必须有限、为正、未交叉、未过期且 spread 不超过 `max_spread_bps`，并且全部
-所需资产验证成功后才原子更新。Stablecoin Basis 不是简单塞进 Dynamic Midline，
-而是作为独立成本和风险输入。下式是参考报价基差，执行成本字段会按买卖方向取符号：
+系统读取 Kraken `USDC/USD` 锚定盘口和直接的 `USDG/USDC` 一档盘口。USDG 指
+Lighter Robinhood 使用的 Paxos USDG；Bitget USDGO 是不同资产，不得替代。
+盘口必须有限、为正、未交叉且 spread 不超过 `max_spread_bps`，并且全部所需资产
+验证成功后才原子更新。REST 接收时间用于新鲜度，不能把静止挂单的档位时间误当成
+接口过期。Stablecoin Basis 不是简单塞进 Dynamic Midline，而是作为独立成本和
+风险输入；中间基差使用直接盘口中间价，买 USDG 使用 Ask，卖 USDG 使用 Bid：
 
 ```text
-USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10000
+USDG/USDC basis bps = ((bid + ask) / 2 - 1) * 10000
 ```
 
 状态：

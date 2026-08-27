@@ -115,6 +115,41 @@ def test_recorder_links_books_to_fresh_quote_usd_rates():
     assert abs(float(row["buy_edge_usd_max_bps"]) - expected_buy) < 0.01
 
 
+def test_recorder_uses_direct_cross_bid_and_ask_by_execution_direction():
+    e_book, h_book = OrderBook(), OrderBook()
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+    set_book(e_book, 100.0, 100.2)
+    set_book(h_book, 99.9, 100.1)
+
+    def quote_rate(venue_key, now):
+        del now
+        return {"entropy": 1.0, "hedge": 1.0005}[venue_key]
+
+    def quote_pair(base_asset, quote_asset, now):
+        del now
+        assert (base_asset, quote_asset) == ("USDG", "USDC")
+        return 1.0, 1.001
+
+    rec = MinuteRecorder(
+        path, e_book, h_book, staleness_sec=1e9,
+        quote_rate_getter=quote_rate,
+        quote_pair_getter=quote_pair,
+        entropy_quote_asset="USDC", hedge_quote_asset="USDG")
+    rec.sample(1_700_000_000.0)
+    rec.close()
+
+    with open(path, newline="") as fh:
+        row = next(csv.DictReader(fh))
+    assert float(row["hedge_entropy_quote_bid_close"]) == 1.0
+    assert float(row["hedge_entropy_quote_ask_close"]) == 1.001
+    assert float(row["hedge_entropy_quote_spread_close_bps"]) == 10.0
+    assert float(row["hedge_entropy_quote_basis_close_bps"]) == 5.0
+    expected_sell = (100.0 / (100.1 * 1.001) - 1.0) * 1e4
+    expected_buy = (99.9 * 1.0 / 100.2 - 1.0) * 1e4
+    assert abs(float(row["sell_edge_usd_max_bps"]) - expected_sell) < 0.01
+    assert abs(float(row["buy_edge_usd_max_bps"]) - expected_buy) < 0.01
+
+
 def test_recorder_keeps_raw_sample_but_never_fakes_missing_fx_as_parity():
     e_book, h_book = OrderBook(), OrderBook()
     path = os.path.join(tempfile.mkdtemp(), "minutes.csv")

@@ -51,6 +51,9 @@ HEADER = ["minute_ts", "time_utc",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples",
           "entropy_quote_asset", "hedge_quote_asset",
           "entropy_quote_usd_close", "hedge_quote_usd_close",
+          "hedge_entropy_quote_bid_close",
+          "hedge_entropy_quote_ask_close",
+          "hedge_entropy_quote_spread_close_bps",
           "hedge_entropy_quote_basis_close_bps",
           "premium_usd_open_bps", "premium_usd_high_bps",
           "premium_usd_low_bps", "premium_usd_close_bps",
@@ -66,7 +69,8 @@ class _MinuteAgg:
                  "hedge_asset", "fx_n", "fx_p_open", "fx_p_high",
                  "fx_p_low", "fx_p_close", "fx_p_sum", "fx_p_sumsq",
                  "fx_s_sum", "fx_s_max", "fx_b_sum", "fx_b_max",
-                 "e_rate", "h_rate", "quote_basis")
+                 "e_rate", "h_rate", "pair_bid", "pair_ask",
+                 "pair_spread", "quote_basis")
 
     def __init__(self, minute: int, entropy_asset: str,
                  hedge_asset: str) -> None:
@@ -88,11 +92,15 @@ class _MinuteAgg:
         self.fx_s_max = -math.inf
         self.fx_b_sum = 0.0
         self.fx_b_max = -math.inf
-        self.e_rate = self.h_rate = self.quote_basis = 0.0
+        self.e_rate = self.h_rate = 0.0
+        self.pair_bid = self.pair_ask = self.pair_spread = 0.0
+        self.quote_basis = 0.0
 
     def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float,
             e_rate: Optional[float] = None,
-            h_rate: Optional[float] = None) -> None:
+            h_rate: Optional[float] = None,
+            pair_bid: Optional[float] = None,
+            pair_ask: Optional[float] = None) -> None:
         e_mid = (e_bid + e_ask) / 2.0
         h_mid = (h_bid + h_ask) / 2.0
         prem = (e_mid / h_mid - 1.0) * 1e4
@@ -118,12 +126,24 @@ class _MinuteAgg:
                     for value in values)):
             return
         e_rate, h_rate = float(e_rate), float(h_rate)
-        fx_prem = (e_mid * e_rate / (h_mid * h_rate) - 1.0) * 1e4
-        fx_sell = (e_bid * e_rate / (h_ask * h_rate) - 1.0) * 1e4
-        fx_buy = (h_bid * h_rate / (e_ask * e_rate) - 1.0) * 1e4
-        quote_basis = (h_rate / e_rate - 1.0) * 1e4
+        if pair_bid is None or pair_ask is None:
+            pair_bid = pair_ask = h_rate / e_rate
+        pair_bid, pair_ask = float(pair_bid), float(pair_ask)
+        if (not all(math.isfinite(value) and value > 0
+                    for value in (pair_bid, pair_ask))
+                or pair_bid > pair_ask):
+            return
+        pair_mid = (pair_bid + pair_ask) / 2.0
+        pair_spread = (pair_ask / pair_bid - 1.0) * 1e4
+        fx_prem = (e_mid / (h_mid * pair_mid) - 1.0) * 1e4
+        # SELL Entropy receives its quote asset and BUY hedge must acquire the
+        # hedge quote asset at the direct cross ask. Reverse direction sells
+        # the hedge quote asset at the direct cross bid.
+        fx_sell = (e_bid / (h_ask * pair_ask) - 1.0) * 1e4
+        fx_buy = (h_bid * pair_bid / e_ask - 1.0) * 1e4
+        quote_basis = (pair_mid - 1.0) * 1e4
         if not all(math.isfinite(value) for value in (
-                fx_prem, fx_sell, fx_buy, quote_basis)):
+                fx_prem, fx_sell, fx_buy, pair_spread, quote_basis)):
             return
         if self.fx_n == 0:
             self.fx_p_open = self.fx_p_high = self.fx_p_low = fx_prem
@@ -138,6 +158,8 @@ class _MinuteAgg:
         self.fx_b_sum += fx_buy
         self.fx_b_max = max(self.fx_b_max, fx_buy)
         self.e_rate, self.h_rate = e_rate, h_rate
+        self.pair_bid, self.pair_ask = pair_bid, pair_ask
+        self.pair_spread = pair_spread
         self.quote_basis = quote_basis
 
     def row(self) -> list:
@@ -156,12 +178,14 @@ class _MinuteAgg:
                 f"{self.b_sum / self.n:.3f}", f"{self.b_max:.3f}",
                 self.n]
         if self.fx_n == 0:
-            return raw + [self.entropy_asset, self.hedge_asset] + [""] * 13 + [0]
+            return raw + [self.entropy_asset, self.hedge_asset] + [""] * 16 + [0]
         fx_mean = self.fx_p_sum / self.fx_n
         fx_var = max(self.fx_p_sumsq / self.fx_n - fx_mean * fx_mean, 0.0)
         return raw + [
             self.entropy_asset, self.hedge_asset,
             f"{self.e_rate:.10g}", f"{self.h_rate:.10g}",
+            f"{self.pair_bid:.10g}", f"{self.pair_ask:.10g}",
+            f"{self.pair_spread:.3f}",
             f"{self.quote_basis:.3f}",
             f"{self.fx_p_open:.3f}", f"{self.fx_p_high:.3f}",
             f"{self.fx_p_low:.3f}", f"{self.fx_p_close:.3f}",
@@ -176,6 +200,8 @@ class MinuteRecorder:
                  staleness_sec: float, interval_sec: float = 1.0, *,
                  quote_rate_getter: Optional[
                      Callable[[str, float], float]] = None,
+                 quote_pair_getter: Optional[
+                     Callable[[str, str, float], tuple[float, float]]] = None,
                  entropy_quote_asset: str = "UNKNOWN",
                  hedge_quote_asset: str = "UNKNOWN") -> None:
         self.path = path
@@ -184,6 +210,7 @@ class MinuteRecorder:
         self.staleness_sec = staleness_sec
         self.interval_sec = interval_sec
         self.quote_rate_getter = quote_rate_getter
+        self.quote_pair_getter = quote_pair_getter
         self.entropy_quote_asset = entropy_quote_asset.upper()
         self.hedge_quote_asset = hedge_quote_asset.upper()
         self.rows_written = 0
@@ -238,13 +265,21 @@ class MinuteRecorder:
             self._agg = _MinuteAgg(
                 minute, self.entropy_quote_asset, self.hedge_quote_asset)
         e_rate = h_rate = None
+        pair_bid = pair_ask = None
         if self.quote_rate_getter is not None:
             try:
                 e_rate = self.quote_rate_getter("entropy", now)
                 h_rate = self.quote_rate_getter("hedge", now)
             except (KeyError, TypeError, ValueError):
                 e_rate = h_rate = None
-        self._agg.add(e_bid, e_ask, h_bid, h_ask, e_rate, h_rate)
+        if self.quote_pair_getter is not None:
+            try:
+                pair_bid, pair_ask = self.quote_pair_getter(
+                    self.hedge_quote_asset, self.entropy_quote_asset, now)
+            except (KeyError, TypeError, ValueError):
+                pair_bid = pair_ask = None
+        self._agg.add(e_bid, e_ask, h_bid, h_ask, e_rate, h_rate,
+                      pair_bid, pair_ask)
 
     def close(self) -> None:
         """Flush the partial minute and close the file (call on shutdown)."""

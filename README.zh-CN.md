@@ -348,10 +348,11 @@ VWAP 最小/最大订单、两边仓位上限、净 Delta、对账差异、成�
 MTM PnL 使用同一套实时 quote→USD 汇率；各 venue 的 `cash` 仍保留原始计价币，
 只在跨 venue 汇总时换算，避免把 USDG、USDC 数字直接相加。
 
-示例配置从 Kraken 公共 REST API 的 `ASSET/USD` 一档盘口读取价格，其中 USDG 是
-Lighter Robinhood 使用的 Paxos USDG。Bitget 的 USDGO 是 Anchorage Digital/OSL
-发行的另一种资产，禁止用它替代 USDG。只有全部所需盘口均为有限正数、未交叉、
-时间新鲜且买卖价差不超过 `max_spread_bps` 时才整批更新；否则保留旧时间戳并最终
+示例配置从 Kraken 公共 REST API 读取 `USDC/USD` 和直接的 `USDG/USDC` 一档盘口，
+其中 USDG 是 Lighter Robinhood 使用的 Paxos USDG。Bitget 的 USDGO 是 Anchorage
+Digital/OSL 发行的另一种资产，禁止用它替代 USDG。只有全部所需盘口均为有限正数、
+未交叉且买卖价差不超过 `max_spread_bps` 时才整批更新；REST 成功接收时间用于判断
+快照新鲜度，档位挂单本身多久未变化不会误判为接口过期。否则保留旧时间戳并最终
 因过期失败关闭。来源缺失或过期会禁止 OPEN/ADD；超过 `halt_deviation_bps` 也会暂停新增风险。必须正确设置每条腿的
 `quote_asset`；默认 Entropy/Lighter 主网/trade.xyz 为 USDC，Lighter Robinhood
 为 USDG。有效中枢门槛也会按当前方向（反向使用精确倒数）换算到同一 USD 比率，
@@ -359,11 +360,13 @@ Lighter Robinhood 使用的 Paxos USDG。Bitget 的 USDGO 是 Anchorage Digital/
 必须启用且取得新鲜的 stablecoin 换算数据，否则拒绝启动；换算过期后，账户变化和
 会话 PnL 显示为未知，不会继续把旧的 USDG/USDC 汇率冒充实时 USD 估值。
 
-参考 USDG/USDC 报价基差由两者各自的真实美元中间价计算；执行成本字段会根据
-买卖方向使用相应正负号：
+USDG/USDC 报价基差直接使用该交易对的中间价；执行成本按方向使用真实盘口：
+买入 USDG 使用 Ask，卖出 USDG 使用 Bid。分钟 CSV 还记录
+`hedge_entropy_quote_bid_close`、`hedge_entropy_quote_ask_close` 和
+`hedge_entropy_quote_spread_close_bps`：
 
 ```text
-USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10,000
+USDG/USDC basis bps = ((bid + ask) / 2 - 1) * 10,000
 ```
 
 ## 密钥配置（`.env`，仅实盘需要）
