@@ -5,6 +5,8 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_book.py)
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
@@ -42,6 +44,13 @@ def test_edge_above_threshold():
     assert plan.exp_edge_usd > 0
 
 
+def test_planner_rejects_nan_threshold_instead_of_bypassing_edge_gate():
+    buy = make_book(bids=[(99.9, 10)], asks=[(100.0, 10)])
+    sell = make_book(bids=[(100.05, 10)], asks=[(100.2, 10)])
+    with pytest.raises(ValueError, match="finite"):
+        plan_arb(buy, sell, **common(threshold_bps=float("nan")))
+
+
 def test_fees_kill_marginal_edge():
     buy = make_book(bids=[(99.9, 10)], asks=[(100.0, 10)])
     sell = make_book(bids=[(100.05, 10)], asks=[(100.2, 10)])  # +5 bps gross
@@ -57,7 +66,18 @@ def test_take_fraction_and_cap():
     plan, reason = plan_arb(buy, sell, **common(take_fraction=0.5))
     assert reason == "ok" and abs(plan.qty - 50.0) < 1e-9
     plan, reason = plan_arb(buy, sell, **common(cap_notional=1000.0))
-    assert reason == "ok" and abs(plan.qty - 10.0) < 1e-6  # $1000 / $100
+    assert reason == "ok"
+    assert plan.buy_notional <= 1000.0 and plan.sell_notional <= 1000.0
+    assert abs(plan.qty - 9.9502) < 1e-9  # sell leg is the tighter cap
+
+
+def test_legacy_cap_applies_to_both_leg_notionals():
+    buy = make_book(bids=[(99.0, 100)], asks=[(100.0, 100)])
+    sell = make_book(bids=[(110.0, 100)], asks=[(111.0, 100)])
+    plan, reason = plan_arb(buy, sell, **common(cap_notional=1000.0))
+    assert reason == "ok"
+    assert plan.buy_notional <= 1000.0 + 1e-9
+    assert plan.sell_notional <= 1000.0 + 1e-9
 
 
 def test_min_notional():
@@ -89,6 +109,27 @@ def test_lighter_diff_maintenance():
                      "asks": [{"price": "100.2", "size": "3"}]},
                     snapshot=True)
     assert b.best_bid() == 98.9 and b.best_ask() == 100.2
+
+
+def test_nonfinite_orderbook_levels_are_discarded():
+    b = OrderBook()
+    b.apply_hl([
+        [{"px": "100", "sz": "1"}, {"px": "inf", "sz": "10"}],
+        [{"px": "101", "sz": "1"}, {"px": "nan", "sz": "10"}],
+    ])
+    assert b.sorted_bids() == [(100.0, 1.0)]
+
+
+def test_exchange_timestamp_age_cannot_be_hidden_by_recent_receive_time():
+    b = OrderBook()
+    b.apply_hl([
+        [{"px": "100", "sz": "1"}],
+        [{"px": "101", "sz": "1"}],
+    ], received_ts=200.0, exchange_ts=199.0)
+    quality = b.quality(10.0, max_book_age_ms=300.0, now=200.0)
+    assert not quality.ok
+    assert quality.reason == "exchange_stale"
+    assert b.sorted_asks() == [(101.0, 1.0)]
 
 
 def test_book_quality_separates_heartbeat_from_book_age():
@@ -126,6 +167,13 @@ def test_book_quality_connection_states_fail_closed():
     quality = b.quality(1.0, now=100.3)
     assert quality.reason == "disconnected"
     assert b.last_disconnect_reason == "test close"
+
+
+def test_book_quality_rejects_crossed_or_locked_book():
+    crossed = make_book(bids=[(101.0, 1.0)], asks=[(100.0, 1.0)])
+    assert crossed.quality(1.0).reason == "crossed_book"
+    locked = make_book(bids=[(100.0, 1.0)], asks=[(100.0, 1.0)])
+    assert locked.quality(1.0).reason == "crossed_book"
 
 
 if __name__ == "__main__":

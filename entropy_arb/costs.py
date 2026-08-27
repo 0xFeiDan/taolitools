@@ -6,6 +6,7 @@ instead of silently treating an unknown cost as zero.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
@@ -44,6 +45,13 @@ class CostMonitor:
     def set_funding(self, venue_key: str, hourly_rate: float, *,
                     observed_at: Optional[float] = None,
                     source: str = "test") -> None:
+        if not math.isfinite(float(hourly_rate)):
+            raise ValueError("funding rate must be finite")
+        if abs(float(hourly_rate)) >= 1.0:
+            raise ValueError("funding rate is out of range; expected an "
+                             "hourly decimal rate in (-1, 1)")
+        if observed_at is not None and not math.isfinite(float(observed_at)):
+            raise ValueError("funding observation time must be finite")
         self.funding_rates[venue_key] = RateObservation(
             float(hourly_rate), time.time() if observed_at is None else observed_at,
             source)
@@ -51,8 +59,10 @@ class CostMonitor:
     def set_quote_usd(self, asset: str, value: float, *,
                       observed_at: Optional[float] = None,
                       source: str = "test") -> None:
-        if value <= 0:
-            raise ValueError("quote USD value must be > 0")
+        if not math.isfinite(float(value)) or value <= 0:
+            raise ValueError("quote USD value must be finite and > 0")
+        if observed_at is not None and not math.isfinite(float(observed_at)):
+            raise ValueError("quote observation time must be finite")
         self.quote_usd[asset.upper()] = RateObservation(
             float(value), time.time() if observed_at is None else observed_at,
             source)
@@ -99,10 +109,30 @@ class CostMonitor:
                        else entropy - hedge)
         return hourly_cost * self.expected_holding_hours * 1e4
 
+    def funding_rate(self, venue_key: str) -> float:
+        if not self.funding_enabled:
+            return 0.0
+        return self.funding_rates[venue_key].value
+
     def quote_rate(self, venue_key: str) -> float:
         if not self.stablecoin_enabled:
             return 1.0
         return self.quote_usd[self.quote_assets[venue_key]].value
+
+    def fresh_quote_rate(self, venue_key: str,
+                         now: Optional[float] = None) -> float:
+        """Return a current quote/USD rate or fail closed with ``KeyError``."""
+        if not self.stablecoin_enabled:
+            return 1.0
+        asset = self.quote_assets[venue_key]
+        if asset == "USD":
+            return 1.0
+        observation = self.quote_usd.get(asset)
+        current = time.time() if now is None else now
+        if not self._fresh(observation, self.stablecoin_max_age_seconds,
+                           current):
+            raise KeyError(f"stale quote/USD observation for {asset}")
+        return observation.value
 
     def stablecoin_basis_cost_bps(self, *, buy_key: str, sell_key: str,
                                   raw_sell_buy_ratio: float = 1.0) -> float:

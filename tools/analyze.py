@@ -48,13 +48,15 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                     continue
                 if int(r["samples"]) < min_samples:
                     continue
-                rows.append({
+                parsed = {
                     "ts": float(r["minute_ts"]),
                     "prem": float(r["premium_close_bps"]),
                     "prem_mean": float(r["premium_mean_bps"]),
                     "sell_max": float(r["sell_edge_max_bps"]),
                     "buy_max": float(r["buy_edge_max_bps"]),
-                })
+                }
+                if all(math.isfinite(value) for value in parsed.values()):
+                    rows.append(parsed)
             except (KeyError, ValueError):
                 continue
     return rows
@@ -114,7 +116,7 @@ def main() -> None:
                       reverse=True)
 
     print(f"\nwith midline_bps = {midline:+.1f} (median) and {fees:.1f} bps "
-          f"round-trip taker fees, minutes each band would have fired / "
+          f"two-leg taker fees per crossing, minutes each band would have fired / "
           f"各档净阈值触发的分钟数:")
     print(f"  {'band bps':>9} | {'SELL entropy':>17} | {'BUY entropy':>17}")
     print(f"  {'':>9} | {'minutes':>8} {'per day':>8} | "
@@ -132,10 +134,10 @@ def main() -> None:
     sug_lower = max(round(pctl(sorted(buy_room), 90) * 2) / 2, 1.0)
     print(f"""
 suggested starting point (fires ~10% of minutes, already net of the
-{fees:.1f} bps fees passed via --fees-bps; a full round trip nets
->= upper+lower bps after fees) /
-建议起点（约 10% 的分钟触发；已扣除 --fees-bps 传入的 {fees:.1f} bps 手续费，
-一次完整往返扣费后净赚 >= upper+lower bps）:
+{fees:.1f} bps per-crossing fees passed via --fees-bps). Bands are signal
+distances, not a guaranteed USD round-trip profit floor. /
+建议起点（约 10% 的分钟触发；已扣除 --fees-bps 传入的每次双腿成交
+{fees:.1f} bps 手续费）。带宽是信号距离，不保证往返美元利润下限：
 
 thresholds:
   midline_bps: {midline}

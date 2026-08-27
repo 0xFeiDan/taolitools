@@ -1,4 +1,7 @@
+import math
 import time
+
+import pytest
 
 from entropy_arb.costs import CostMonitor
 from entropy_arb.pricing import executable_edge
@@ -13,6 +16,16 @@ def monitor(**overrides):
         quote_assets={"entropy": "USDC", "hedge": "USDG"})
     values.update(overrides)
     return CostMonitor(**values)
+
+
+def test_external_cost_observations_reject_nonfinite_values():
+    costs = monitor()
+    with pytest.raises(ValueError, match="finite"):
+        costs.set_funding("entropy", math.nan)
+    with pytest.raises(ValueError, match="finite"):
+        costs.set_quote_usd("USDC", math.inf)
+    with pytest.raises(ValueError, match="out of range"):
+        costs.set_funding("entropy", 1.0)
 
 
 def test_enabled_cost_inputs_fail_closed_when_missing_or_stale():
@@ -54,3 +67,20 @@ def test_executable_edge_normalizes_each_quote_asset_exactly():
                - (edge.gross_edge_bps - expected_adjusted)) < 1e-9
     assert abs(edge.expected_net_edge_bps
                - (expected_adjusted - 2.0)) < 1e-9
+
+
+def test_funding_uses_each_legs_actual_usd_notional():
+    edge = executable_edge(
+        [(100.0, 10.0)], [(101.0, 10.0)], 1.0,
+        buy_fee_bps=0.0, sell_fee_bps=0.0,
+        buy_quote_usd=0.99, sell_quote_usd=1.0,
+        buy_funding_rate=0.0003, sell_funding_rate=0.0001,
+        expected_holding_hours=2.0)
+    assert edge is not None
+    buy_usd = 100.0 * 0.99
+    sell_usd = 101.0
+    expected_funding = (buy_usd * 0.0003 - sell_usd * 0.0001) * 2.0
+    expected_bps = expected_funding / buy_usd * 1e4
+    assert abs(edge.funding_cost_bps - expected_bps) < 1e-12
+    expected_profit = sell_usd - buy_usd - expected_funding
+    assert abs(edge.expected_net_profit_usd - expected_profit) < 1e-12

@@ -28,16 +28,19 @@
 # Dynamic mode uses entry_z_score / exit_z_score below and ignores upper/lower.
 # Dynamic 模式使用下方 entry_z_score / exit_z_score，忽略 upper/lower。
 #
-# Both hurdles are net of taker fees (the engine adds fees on top), so one
-# full round trip nets >= upper + lower bps after fees by construction.
+# The engine adds both venues' taker fees to each directional hurdle. The
+# bands are signal distances in ratio/bps space, not a guaranteed USD profit:
+# the common price level, fills, funding, and quote/USD rates can move between
+# entry and exit.
 #
 # midline_bps is a number YOU derive from recorded data. Run the bot
 # (--record-only) to collect logs/minutes.csv, then:  python3 tools/analyze.py
 #
 # midline_bps 是你根据采集数据设定的值。先运行机器人（--record-only）采集
 # logs/minutes.csv，再运行 python3 tools/analyze.py 获取建议值。
-# 两个方向的门槛都已扣除手续费（引擎会在此之上另加手续费），因此一次完整往返
-# 扣费后净赚 >= upper + lower bps。
+# 引擎会在两个方向门槛上叠加双边手续费。upper/lower 只定义比率/bps 信号距离，
+# 不保证固定美元利润；进出场之间的共同价格水平、成交、Funding 和 quote/USD
+# 汇率都可能变化。
 thresholds:
   midline_bps: 0.0     # persistent premium center / 溢价长期中枢
   upper_bps: 4.0       # entry above midline: sell entropy / 中枢上方入场带宽
@@ -98,7 +101,7 @@ entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
   quote_asset: USDC          # collateral/price denomination / 计价资产
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
-  max_position_usd: 1000     # position cap / 持仓上限（美元）
+  max_position_usd: 500      # conservative example cap / 保守示例持仓上限（美元）
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
@@ -106,21 +109,21 @@ hedge:
   # The CLI selection supplies that default; only override for a known change.
   # 程序会根据 --hedge 自动选择默认值；只有交易所规则变化时才手动覆盖 quote_asset。
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
-  max_position_usd: 1000
+  max_position_usd: 500
   max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
 # ========================= SIZING / 下单规模 ===============================
 sizing:
   take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
-  max_order_notional_usd: 500  # per-slice cap / 单笔名义上限
+  max_order_notional_usd: 100  # legacy per-slice cap / 旧模式单笔名义上限
   min_order_notional_usd: 10   # skip dust / 低于此名义不下单
   # V2 current-orderbook VWAP sizing. This walks live depth, not candle VWAP.
   # V2 当前盘口 VWAP 自动仓位：逐档模拟实时深度，不是 K 线 VWAP。
   # Disable to retain the legacy take_fraction + max_order_notional path.
   # 关闭后继续使用旧版 take_fraction + max_order_notional 逻辑。
   vwap_enabled: true
-  min_order_usd: 1000
-  max_order_usd: 50000
+  min_order_usd: 10
+  max_order_usd: 100
   # Minimum deviation from the active directional midline after modeled costs.
   # 扣除建模成本后，相对当前有效中枢的最小方向偏离。
   minimum_net_edge_bps: 6.0
@@ -137,15 +140,15 @@ sizing:
 # 满仓时的 scale_bps。避免单边持仓快速堆满。 scale_bps: 0 disables / 0 为关闭。
 inventory:
   scale_bps: 10.0
-  floor_frac: 0
+  floor_frac: 0.5
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 0     # edge must persist this long before firing / 信号需持续时间
-  cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
+  premium_persist_sec: 0.3     # edge must persist this long before firing / 信号需持续时间
+  cooldown_sec: 1.0            # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
-  leg_slippage_bps: 50.0       # taker limit protection per leg / 每腿滑点保护
-  hedge_slippage_bps: 20.0     # price protection on delta hedges / 对冲滑点保护
+  leg_slippage_bps: 10.0       # taker limit protection per leg / 每腿滑点保护
+  hedge_slippage_bps: 15.0     # price protection on delta hedges / 对冲滑点保护
   net_tolerance_base: 0.001    # max tolerated net delta (base units) / 允许的净敞口
   max_consecutive_errors: 3    # halt after N straight failures / 连续失败 N 次后停机
   rate_limit_pause_sec: 10.0   # pause a 429'd venue this long / 被限频后的暂停时长
@@ -154,12 +157,13 @@ execution:
   venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
   http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
   # V2 one-leg recovery. On timeout, a confirmed OPEN/ADD leg is immediately
-  # unwound reduce-only; unresolved/EXIT outcomes are reconciled then hedged.
+  # unwound reduce-only. EXIT is always reduce-only. Any unresolved outcome
+  # persistently pauses OPEN/ADD before locks are released, then reconciles.
   # V2 单腿恢复：超时后立即 reduce-only 撤销已确认的 OPEN/ADD 单腿；
-  # 未知结果和 EXIT 等待确认后再对账、恢复 Delta Neutral。
+  # EXIT 两腿强制 reduce-only；未知结果在释放执行锁前持久暂停新增，再对账恢复。
   risk_recovery_enabled: true
   hedge_timeout_ms: 250
-  max_unhedged_delta_usd: 5000
+  max_unhedged_delta_usd: 100
 
 # V2 unified kill-switch contract. Emergency flatten stays separately gated
 # because it sends real reduce-only orders and must never be enabled implicitly.
@@ -168,8 +172,8 @@ kill_switch:
   enabled: true
   max_unhedged_duration_ms: 1000
   max_consecutive_partial_fills: 3
-  max_reconcile_mismatch_usd: 1000
-  max_session_loss_usd: 0       # 0 = disabled / 0 表示不按会话亏损触发
+  max_reconcile_mismatch_usd: 50
+  max_session_loss_usd: 25      # 0 = disabled / 0 表示不按会话亏损触发
   emergency_flatten_enabled: false
   emergency_flatten_retry_sec: 2
   emergency_flatten_max_attempts: 0  # 0 = retry until flat / 0 = 持续重试直到平仓

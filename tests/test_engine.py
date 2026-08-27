@@ -7,6 +7,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -65,6 +66,12 @@ class StubVenue:
         self.book = OrderBook()
         self.send_delay = 0.0
         self.fill_fraction = 1.0
+        self.unresolved = False
+        self.reduce_only_unresolved = False
+        self.return_avg_px = True
+        self.raise_after_send = False
+        self.hang_after_send = False
+        self.fill_override = None
         self.sent_orders = []
 
     def ready_to_trade(self):
@@ -84,9 +91,19 @@ class StubVenue:
         filled = qty * self.fill_fraction
         self.sent_orders.append({
             "is_buy": is_buy, "qty": qty, "reduce_only": reduce_only})
+        if self.hang_after_send:
+            await asyncio.Event().wait()
+        if self.raise_after_send:
+            raise asyncio.TimeoutError("response lost after dispatch")
+        if self.fill_override is not None:
+            filled = self.fill_override
         return {
-            "status": "filled", "filled_base": filled, "avg_px": limit_px,
-            "err": None, "unresolved": False, "order_send_ts": now,
+            "status": "filled", "filled_base": filled,
+            "err": None,
+            "unresolved": self.unresolved
+            or (reduce_only and self.reduce_only_unresolved),
+            "avg_px": limit_px if self.return_avg_px else None,
+            "order_send_ts": now,
             "order_ack_ts": now, "first_fill_ts": now,
             "final_fill_ts": now,
         }
@@ -209,14 +226,10 @@ def test_eff_threshold_directions():
     e, h = eng.entropy, eng.hedge
     # sell entropy: hurdle = midline + upper = 9
     approx(eng._eff_threshold(buy=h, sell=e), 9.0)
-    # buy entropy: hurdle = lower - midline = -2 (unwind side of a positive
-    # midline is deliberately cheap — that's what completes the round trip)
-    approx(eng._eff_threshold(buy=e, sell=h), -2.0)
-    # round trip nets upper + lower regardless of midline sign
-    for m in (-7.0, 0.0, 12.5):
-        eng.cfg.midline_bps = m
-        total = eng._eff_threshold(buy=h, sell=e) + eng._eff_threshold(buy=e, sell=h)
-        approx(total, 7.0)
+    # buy entropy converts the raw (midline-lower)=2 bps boundary into the
+    # exact reciprocal H/E ratio rather than approximating it as -2 bps.
+    reverse = (1.0 / (1.0 + 2.0 / 1e4) - 1.0) * 1e4
+    approx(eng._eff_threshold(buy=e, sell=h), reverse)
 
 
 def test_vwap_hurdle_preserves_static_midline_round_trip_semantics():
@@ -227,7 +240,8 @@ def test_vwap_hurdle_preserves_static_midline_round_trip_semantics():
     # It therefore applies symmetrically without making the normal unwind
     # side of a non-zero basis impossible.
     approx(eng._vwap_required_net_edge(buy=h, sell=e), 11.0)
-    approx(eng._vwap_required_net_edge(buy=e, sell=h), 1.0)
+    reverse_target = (1.0 / (1.0 - 1.0 / 1e4) - 1.0) * 1e4
+    approx(eng._vwap_required_net_edge(buy=e, sell=h), reverse_target)
 
 
 def test_engine_passes_funding_and_quote_basis_into_vwap_plan():
@@ -245,9 +259,27 @@ def test_engine_passes_funding_and_quote_basis_into_vwap_plan():
 
     buy, sell, plan = run_scan(eng)
     assert buy.key == "hedge" and sell.key == "entropy"
-    approx(plan.funding_cost_bps, 2.0)
+    expected_funding = (
+        plan.buy_notional * 0.0003 - plan.sell_notional * 0.0001)
+    approx(plan.funding_cost_bps,
+           expected_funding / plan.buy_notional * 1e4)
     assert plan.stablecoin_basis_bps < 0
     assert plan.adjusted_gross_edge_bps > plan.gross_vwap_edge_bps
+
+
+def test_usdg_basis_normalizes_the_midline_hurdle_in_both_directions():
+    # A raw -10 bps Entropy/USDG ratio is exactly flat in USD when USDG=$0.999.
+    eng = make_engine(midline=-10.0, upper=4.0, lower=4.0)
+    enable_vwap(eng, minimum_net_edge_bps=1.0)
+    eng.costs.stablecoin_enabled = True
+    eng.costs.set_quote_usd("USDC", 1.0)
+    eng.costs.set_quote_usd("USDG", 0.999)
+    sell_hurdle = eng._vwap_required_net_edge(eng.hedge, eng.entropy)
+    buy_hurdle = eng._vwap_required_net_edge(eng.entropy, eng.hedge)
+    expected_sell = ((1.0 - 6.0 / 1e4) / 0.999 - 1.0) * 1e4
+    expected_buy = (0.999 / (1.0 - 14.0 / 1e4) - 1.0) * 1e4
+    approx(sell_hurdle, expected_sell)
+    approx(buy_hurdle, expected_buy)
 
 
 def test_dynamic_warmup_blocks_then_zscore_ignores_static_bps_band():
@@ -378,8 +410,11 @@ def test_dynamic_exit_is_capped_to_remaining_pair_and_cannot_reverse(tmp_path):
     assert plan.signal_action == "EXIT"
     assert plan.pair_id == "ARB-OPEN-1"
     assert plan.qty <= 1.2345
-    assert plan.required_net_edge_bps == -6.0
+    expected_reverse = (1.0 / (1.0 + 6.0 / 1e4) - 1.0) * 1e4
+    approx(plan.required_net_edge_bps, expected_reverse)
     asyncio.run(eng._execute(buy, sell, plan))
+    assert buy.sent_orders[-1]["reduce_only"]
+    assert sell.sent_orders[-1]["reduce_only"]
     assert not eng.pair_position.is_open
     assert abs(eng.entropy.position) < 1e-9
     assert abs(eng.hedge.position) < 1e-9
@@ -398,6 +433,122 @@ def test_startup_position_sync_recovers_only_matched_pair_quantity():
     eng.hedge.position = 1.0
     eng._sync_pair_position_from_venues()
     assert eng.pair_position.pair_id == recovered_id
+
+
+def test_startup_matched_position_missing_from_ledger_pauses_entry(tmp_path):
+    eng = make_engine()
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    eng.entropy.position = -1.0
+    eng.hedge.position = 1.0
+    eng._sync_pair_position_from_venues()
+    assert eng.pair_position.is_open
+    assert "ledger_position_recovered" in eng._entry_pause_reasons
+
+
+def test_startup_unhedged_position_persistently_pauses_before_strategy():
+    eng = make_engine()
+    eng.entropy.position = 2.0
+    eng.hedge.position = -1.0
+    eng._guard_startup_positions()
+    assert "startup_unhedged_position" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+    assert eng.strategy_pause_reason().startswith("kill:")
+
+
+def test_unknown_order_outcome_persistently_pauses_before_locks_release(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.trades_csv = str(tmp_path / "unknown.csv")
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.unresolved = True
+
+    async def execute_locked():
+        await eng._vlock(buy.key).acquire()
+        await eng._vlock(sell.key).acquire()
+        await eng._execute_locked(buy, sell, plan)
+
+    asyncio.run(execute_locked())
+    assert "unresolved_order_outcome" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+    assert eng.strategy_pause_reason().startswith("kill:")
+
+
+def test_unknown_order_pause_survives_restart(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.accounting = replace(
+        eng.cfg.accounting, enabled=True,
+        ledger_jsonl=str(tmp_path / "pairs.jsonl"),
+        state_json=str(tmp_path / "state.json"))
+    eng.ledger = PairLedger(eng.cfg.accounting.ledger_jsonl,
+                            eng.cfg.accounting.state_json)
+    eng.cfg.trades_csv = str(tmp_path / "unknown-restart.csv")
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.unresolved = True
+
+    async def execute_locked():
+        await eng._vlock(buy.key).acquire()
+        await eng._vlock(sell.key).acquire()
+        await eng._execute_locked(buy, sell, plan)
+
+    asyncio.run(execute_locked())
+    restored = Engine(eng.cfg)
+    assert "unresolved_order_outcome" in restored._entry_pause_reasons
+
+
+def test_missing_actual_fill_price_pauses_and_marks_pair_incomplete(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.trades_csv = str(tmp_path / "missing-price.csv")
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.return_avg_px = False
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert "incomplete_fill_accounting" in eng._entry_pause_reasons
+    assert eng.ledger.current is not None
+    assert not eng.ledger.current.accounting_complete
+    assert buy.cash == 0.0
+    assert eng.session_pnl() is None
+
+
+def test_adapter_exception_after_dispatch_is_unknown_and_pauses(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.trades_csv = str(tmp_path / "adapter-exception.csv")
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.raise_after_send = True
+
+    async def execute_locked():
+        await eng._vlock(buy.key).acquire()
+        await eng._vlock(sell.key).acquire()
+        await eng._execute_locked(buy, sell, plan)
+
+    asyncio.run(execute_locked())
+    assert "unresolved_order_outcome" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+
+
+def test_nonfinite_fill_result_is_unknown_and_never_updates_positions(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.trades_csv = str(tmp_path / "nan-fill.csv")
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.fill_override = float("nan")
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert buy.position == 0.0
+    assert "invalid_order_result" in eng._entry_pause_reasons
+
+
+def test_pending_or_unrecognized_adapter_status_is_never_treated_as_no_fill():
+    eng = make_engine()
+    for status in ("accepted", "pending", "mystery"):
+        info = eng._normalize_order_result(
+            {"status": status, "filled_base": 0.0, "avg_px": None,
+             "err": None, "unresolved": False},
+            1.0, venue_key="entropy", pair_id="ARB-PENDING")
+        assert info["unresolved"] is True
 
 
 def test_matched_open_fill_updates_minimal_pair_position(tmp_path):
@@ -446,6 +597,56 @@ def test_hedge_timeout_unwinds_known_open_leg_and_finishes_recovery(tmp_path):
     assert eng.ledger.completed[0].recovery_pnl <= 0
 
 
+def test_unknown_recovery_order_keeps_entry_paused_for_reconciliation(tmp_path):
+    eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
+    enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
+    eng.cfg.execution_risk = replace(
+        eng.cfg.execution_risk, enabled=True, hedge_timeout_ms=10.0,
+        max_unhedged_delta_usd=100.0)
+    eng.cfg.trades_csv = str(tmp_path / "unknown-recovery.csv")
+    set_ready_stats(eng, z_score=3.0, slow=0.0, volatility=5.0)
+    buy, sell, plan = run_scan(eng)
+    sell.send_delay = 0.05
+    buy.reduce_only_unresolved = True
+
+    async def execute_locked():
+        await eng._vlock(buy.key).acquire()
+        await eng._vlock(sell.key).acquire()
+        await eng._execute_locked(buy, sell, plan)
+
+    asyncio.run(execute_locked())
+    assert "unresolved_order_outcome" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+
+
+def test_adapter_that_never_returns_becomes_unknown_without_holding_locks(
+        tmp_path):
+    eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
+    enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
+    eng.cfg.execution_risk = replace(
+        eng.cfg.execution_risk, enabled=True, hedge_timeout_ms=5.0,
+        max_unhedged_delta_usd=100.0)
+    eng.cfg.settle_timeout_sec = 0.03
+    eng.cfg.trades_csv = str(tmp_path / "hung-adapter.csv")
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    set_ready_stats(eng, z_score=3.0, slow=0.0, volatility=5.0)
+    buy, sell, plan = run_scan(eng)
+    sell.hang_after_send = True
+
+    async def execute_locked():
+        await eng._vlock(buy.key).acquire()
+        await eng._vlock(sell.key).acquire()
+        return await asyncio.wait_for(
+            eng._execute_locked(buy, sell, plan), timeout=0.2)
+
+    assert asyncio.run(execute_locked()) is None
+    assert not eng._vlock(buy.key).locked()
+    assert not eng._vlock(sell.key).locked()
+    assert "unresolved_order_outcome" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+
+
 def test_consecutive_partial_fill_kill_switch_pauses_new_entries(tmp_path):
     eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
     enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
@@ -469,6 +670,22 @@ def test_consecutive_partial_fill_kill_switch_pauses_new_entries(tmp_path):
     assert eng.risk_events[-1].action.value == "PAUSE_NEW_ENTRY"
 
 
+def test_equal_partial_fills_still_count_toward_partial_fill_kill_switch(
+        tmp_path):
+    eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
+    enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
+    eng.cfg.kill_switch = replace(
+        eng.cfg.kill_switch, enabled=True,
+        max_consecutive_partial_fills=1)
+    eng.cfg.trades_csv = str(tmp_path / "equal-partials.csv")
+    set_ready_stats(eng, z_score=3.0, slow=0.0, volatility=5.0)
+    buy, sell, plan = run_scan(eng)
+    buy.fill_fraction = sell.fill_fraction = 0.5
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert eng.consecutive_partial_fills == 1
+    assert "consecutive_partial_fills" in eng._entry_pause_reasons
+
+
 def test_persistent_unhedged_delta_triggers_kill_pause():
     eng = make_engine()
     eng.cfg.execution_risk = replace(
@@ -490,6 +707,35 @@ def test_persistent_unhedged_delta_triggers_kill_pause():
     actions = [event.action.value for event in eng.risk_events]
     assert "EMERGENCY_HEDGE" in actions
     assert "PAUSE_NEW_ENTRY" in actions
+
+
+def test_unhedged_delta_immediately_pauses_open_add_during_recovery():
+    eng = make_engine()
+    eng.cfg.execution_risk = replace(
+        eng.cfg.execution_risk, enabled=True,
+        max_unhedged_delta_usd=10.0)
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.entropy.position = 1.0
+    asyncio.run(eng._risk_check_once())
+    assert "net_delta_limit" in eng._transient_entry_pause_reasons
+    assert eng.strategy_pause_reason().startswith("risk:")
+
+
+def test_unpriced_unhedged_delta_does_not_reset_kill_duration():
+    eng = make_engine()
+    eng.cfg.execution_risk = replace(
+        eng.cfg.execution_risk, enabled=True,
+        max_unhedged_delta_usd=10.0)
+    eng.cfg.kill_switch = replace(
+        eng.cfg.kill_switch, enabled=True,
+        max_unhedged_duration_ms=1.0)
+    eng.entropy.position = 1.0  # no valid books, so USD value is unknown
+    asyncio.run(eng._risk_check_once())
+    assert eng._unhedged_since is not None
+    eng._unhedged_since = time.time() - 1.0
+    asyncio.run(eng._risk_check_once())
+    assert "net_delta_duration" in eng._entry_pause_reasons
 
 
 def test_emergency_flatten_uses_reduce_only_and_updates_local_accounting():
@@ -530,6 +776,161 @@ def test_emergency_flatten_failure_is_retained_and_retried():
     assert abs(eng.entropy.position) < 1e-12
 
 
+def test_emergency_flatten_rejects_below_minimum_notional_order():
+    eng = make_engine()
+    eng.entropy.position = 0.01
+    eng.entropy.set_book(99.9, 100.1)
+    assert asyncio.run(eng._emergency_flatten()) is False
+    assert not eng.entropy.sent_orders
+    assert eng._flatten_required
+
+
+def test_emergency_flatten_is_idempotent_under_concurrent_callers():
+    eng = make_engine()
+    eng.entropy.position = 1.0
+    eng.hedge.position = -1.0
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.entropy.send_delay = eng.hedge.send_delay = 0.02
+
+    async def run_both():
+        return await asyncio.gather(
+            eng._emergency_flatten(), eng._emergency_flatten())
+
+    asyncio.run(run_both())
+    assert len(eng.entropy.sent_orders) == 1
+    assert len(eng.hedge.sent_orders) == 1
+    assert eng._flatten_attempts == 1
+
+
+def test_kill_switch_hedge_and_flatten_cannot_double_reduce_same_position():
+    eng = make_engine()
+    eng.cfg.execution_risk = replace(
+        eng.cfg.execution_risk, enabled=True,
+        max_unhedged_delta_usd=1.0)
+    eng.entropy.position = 1.0
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.entropy.send_delay = 0.02
+
+    async def race_risk_actions():
+        await asyncio.gather(
+            eng._emergency_flatten(), eng._risk_check_once())
+
+    asyncio.run(race_risk_actions())
+    assert len(eng.entropy.sent_orders) == 1
+    assert eng.entropy.sent_orders[0]["reduce_only"] is True
+    assert abs(eng.entropy.position) < 1e-12
+
+
+def test_emergency_flatten_hung_adapter_is_unknown_and_releases_lock():
+    eng = make_engine()
+    eng.cfg.settle_timeout_sec = 0.02
+    eng.entropy.position = 1.0
+    eng.entropy.set_book(99.9, 100.1)
+    eng.entropy.hang_after_send = True
+
+    async def flatten_bounded():
+        return await asyncio.wait_for(eng._emergency_flatten(), timeout=0.2)
+
+    assert asyncio.run(flatten_bounded()) is False
+    assert eng._flatten_required
+    assert not eng._vlock("entropy").locked()
+    assert "unknown_risk_order_outcome" in eng._entry_pause_reasons
+    assert eng._reconcile_evt.is_set()
+
+
+def test_preflight_rechecks_position_headroom_before_dispatch():
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    buy.position = buy.cap_usd / plan.buy_limit
+    sell.position = -sell.cap_usd / plan.sell_limit
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert not buy.sent_orders and not sell.sent_orders
+
+
+def test_preflight_rechecks_dynamic_signal_after_stats_change():
+    eng = make_engine(midline=0.0, upper=1000.0, lower=1000.0)
+    enable_dynamic(eng, min_samples=1, entry_z_score=1.5)
+    enable_vwap(eng, min_order_usd=10.0, minimum_net_edge_bps=1.0)
+    set_ready_stats(eng, z_score=3.0, slow=0.0, volatility=5.0)
+    buy, sell, plan = run_scan(eng)
+    eng.spread_stats = replace(eng.spread_stats, z_score=0.0,
+                               deviation_bps=0.0)
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert not buy.sent_orders and not sell.sent_orders
+
+
+def test_final_dispatch_gate_rejects_book_that_ages_during_audit_write(
+        tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.market_data = MarketDataConfig(
+        enforce_book_age=True, max_book_age_ms=5.0)
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+
+    def slow_append(*_args, **_kwargs):
+        time.sleep(0.02)
+
+    eng.ledger.append_event = slow_append
+    asyncio.run(eng._execute(buy, sell, plan))
+    assert not buy.sent_orders and not sell.sent_orders
+
+
+def test_two_concurrent_signals_share_the_same_position_cap():
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.entropy.cap_usd = eng.hedge.cap_usd = 100.0
+    set_premium(eng, 20.0)
+    assert run_scan(eng) is not None  # arm the zero-persistence signal
+
+    async def race():
+        await asyncio.gather(eng._evaluate(), eng._evaluate())
+
+    asyncio.run(race())
+    assert len(eng.entropy.sent_orders) == 1
+    assert len(eng.hedge.sent_orders) == 1
+    assert abs(eng.entropy.position * eng.entropy.book.mid()) <= 100.01
+    assert abs(eng.hedge.position * eng.hedge.book.mid()) <= 100.01
+
+
+def test_shutdown_with_inflight_execution_persists_pause():
+    eng = make_engine()
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(10.0))
+        eng._exec_tasks.add(task)
+        try:
+            pending = await eng._wait_for_inflight_shutdown(timeout=0.001)
+            assert task in pending
+            assert eng._reconcile_evt.is_set()
+            assert "shutdown_inflight_unknown" in eng._entry_pause_reasons
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_live_mode_requires_ledger_and_non_usd_quote_conversion(tmp_path):
+    eng = make_engine()
+    with pytest.raises(RuntimeError, match="accounting.enabled"):
+        eng._require_live_persistence()
+
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    with pytest.raises(RuntimeError, match="non-USD quote"):
+        eng._require_live_persistence()
+    eng.cfg.stablecoin = replace(eng.cfg.stablecoin, enabled=True)
+    eng._require_live_persistence()
+
+    record = make_engine()
+    record.record_only = True
+    record._require_live_persistence()
+
+
 def test_runtime_state_restores_execution_risk_and_open_pair(tmp_path):
     cfg = make_cfg()
     cfg.accounting = replace(
@@ -553,6 +954,10 @@ def test_runtime_state_restores_execution_risk_and_open_pair(tmp_path):
     eng._risk_event(
         "restore_pause", RiskAction.PAUSE_NEW_ENTRY,
         "restore test", persistent=True)
+    eng._unmatched_legs["ARB-RESTORE"] = {
+        "venue_key": "entropy", "original_is_buy": False,
+        "original_px": 100.0, "remaining_qty": 0.5,
+        "pair_direction": "sell_entropy"}
     eng._flatten_required = True
     eng._persist_runtime()
 
@@ -563,6 +968,25 @@ def test_runtime_state_restores_execution_risk_and_open_pair(tmp_path):
     assert restored.risk_events[-1].trigger == "restore_pause"
     assert "restore_pause" in restored._entry_pause_reasons
     assert restored._flatten_required
+    assert restored._unmatched_legs["ARB-RESTORE"]["remaining_qty"] == 0.5
+
+
+def test_restart_with_orders_sent_state_synthesizes_persistent_pause(tmp_path):
+    cfg = make_cfg()
+    cfg.accounting = replace(
+        cfg.accounting, enabled=True,
+        ledger_jsonl=str(tmp_path / "pairs.jsonl"),
+        state_json=str(tmp_path / "state.json"))
+    eng = Engine(cfg)
+    execution = PairExecution.new(
+        pair_id="ARB-INFLIGHT", symbol="SNDK", venue_a="ENTROPY",
+        venue_b="RH", direction=PairDirection.SELL_ENTROPY)
+    eng.execution_history.append(execution)
+    eng._transition_execution(
+        execution, ExecutionState.SIGNAL_CONFIRMED, "signal")
+    eng._transition_execution(execution, ExecutionState.ORDERS_SENT, "sent")
+    restored = Engine(cfg)
+    assert "restart_inflight_execution" in restored._entry_pause_reasons
 
 
 def test_operator_can_clear_persisted_pause_only_when_flat(tmp_path):
@@ -791,6 +1215,145 @@ def test_scan_respects_position_caps():
     assert run_scan(eng) is None
 
 
+def test_position_headroom_and_session_pnl_use_quote_usd_rates():
+    eng = make_engine()
+    eng.costs.stablecoin_enabled = True
+    eng.costs.set_quote_usd("USDC", 2.0)
+    eng.costs.set_quote_usd("USDG", 0.5)
+    eng.hedge.cap_usd = eng.entropy.cap_usd = 1000.0
+    eng.hedge.position = 2.0
+    eng.entropy.position = -2.0
+    approx(eng._headroom(eng.hedge, eng.entropy, 100.0, 100.0), 600.0)
+
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.entropy.position = eng.hedge.position = 0.0
+    eng.entropy.cash = eng.hedge.cash = 10.0
+    approx(eng.session_pnl(), 0.0)
+    eng.entropy.cash += 1.0
+    eng.hedge.cash += 1.0
+    approx(eng.session_pnl(), 2.5)
+
+
+def test_session_pnl_and_account_delta_reject_stale_quote_usd_rates():
+    eng = make_engine()
+    eng.costs.stablecoin_enabled = True
+    stale = time.time() - eng.costs.stablecoin_max_age_seconds - 1.0
+    eng.costs.set_quote_usd("USDC", 1.0, observed_at=stale)
+    eng.costs.set_quote_usd("USDG", 0.99, observed_at=stale)
+    for venue in eng.venues.values():
+        venue.set_book(99.9, 100.1)
+        venue.equity = 100.0
+        venue.start_equity = 99.0
+    assert eng.session_pnl() is None
+    assert eng.account_delta() is None
+
+
+def test_realized_funding_is_converted_from_each_quote_asset_to_usd(tmp_path):
+    eng = make_engine()
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    pair = eng.ledger.ensure_pair(
+        pair_id="ARB-FUNDING", symbol="SNDK", venue_a="ENTROPY",
+        venue_b="RH", direction="sell_entropy", entry_time=1.0)
+    eng.cfg.funding = replace(eng.cfg.funding, enabled=True)
+    eng.costs.stablecoin_enabled = True
+    eng.costs.set_quote_usd("USDC", 1.0)
+    eng.costs.set_quote_usd("USDG", 0.5)
+
+    async def one_unit(_start):
+        return 1.0
+
+    eng.entropy.fetch_funding_cost_since = one_unit
+    eng.hedge.fetch_funding_cost_since = one_unit
+    asyncio.run(eng._refresh_pair_funding(pair))
+    approx(pair.funding, 1.5)
+
+
+def test_persistence_failure_halts_new_risk_without_raising():
+    eng = make_engine()
+
+    class BrokenLedger:
+        current = None
+
+        def snapshot(self, _runtime):
+            raise OSError("disk full")
+
+    eng.ledger = BrokenLedger()
+    eng._risk_event("test", RiskAction.PAUSE_NEW_ENTRY,
+                    "test persistence", persistent=True)
+    assert eng.halted
+    assert "persistence_failure" in eng._entry_pause_reasons
+
+
+def test_record_only_execute_defense_never_calls_venues():
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.record_only = True
+    set_premium(eng, 20.0)
+    buy, sell, plan = run_scan(eng)
+    assert asyncio.run(eng._execute(buy, sell, plan)) is False
+    assert not buy.sent_orders and not sell.sent_orders
+
+
+def test_static_exit_is_capped_to_reconciled_closeable_quantity():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.pair_position.sync(PairDirection.SELL_ENTROPY, 2.0,
+                           pair_id="ARB-EXIT-CAP")
+    eng.entropy.position = -0.5
+    eng.hedge.position = 2.0
+    eng.entropy.set_book(99.94, 99.96, sz=50.0)
+    eng.hedge.set_book(99.99, 100.01, sz=50.0)
+    buy, sell, plan = run_scan(eng)
+    assert plan.signal_action == "EXIT"
+    assert plan.qty <= 0.5
+
+
+def test_exit_bypasses_entry_cooldown_persistence_and_order_budget():
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.cooldown_sec = 3600.0
+    eng.cfg.premium_persist_sec = 3600.0
+    eng.last_trade_ts = time.time()
+    eng.pair_position.sync(PairDirection.SELL_ENTROPY, 1.0,
+                           pair_id="ARB-EXIT-NOW")
+    eng.entropy.position = -1.0
+    eng.hedge.position = 1.0
+    eng.entropy.set_book(99.94, 99.96, sz=50.0)
+    eng.hedge.set_book(99.99, 100.01, sz=50.0)
+    now = time.time()
+    eng._sends["entropy"] = __import__("collections").deque(
+        [now] * eng.entropy.orders_per_min)
+    eng._sends["hedge"] = __import__("collections").deque(
+        [now] * eng.hedge.orders_per_min)
+    eng._venue_limited_until = {"entropy": now + 60, "hedge": now + 60}
+    eng.halted = True  # a strategy/persistence halt must not trap an open Pair
+    asyncio.run(eng._evaluate())
+    assert eng.entropy.sent_orders and eng.hedge.sent_orders
+    assert eng.entropy.sent_orders[-1]["reduce_only"]
+    assert eng.hedge.sent_orders[-1]["reduce_only"]
+
+
+def test_exit_still_dispatches_reduce_only_when_audit_append_fails(tmp_path):
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                            str(tmp_path / "state.json"))
+    eng.pair_position.sync(PairDirection.SELL_ENTROPY, 1.0,
+                           pair_id="ARB-EXIT-DISK")
+    eng.entropy.position = -1.0
+    eng.hedge.position = 1.0
+    eng.entropy.set_book(99.94, 99.96, sz=50.0)
+    eng.hedge.set_book(99.99, 100.01, sz=50.0)
+
+    def broken_append(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    eng.ledger.append_event = broken_append
+    asyncio.run(eng._evaluate())
+    assert eng.entropy.sent_orders and eng.hedge.sent_orders
+    assert all(order["reduce_only"] for order in
+               eng.entropy.sent_orders + eng.hedge.sent_orders)
+    assert "persistence_failure" in eng._entry_pause_reasons
+
+
 def test_scan_rejects_old_book_even_when_heartbeat_is_live():
     eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
     eng.cfg.market_data = MarketDataConfig(
@@ -803,6 +1366,19 @@ def test_scan_rejects_old_book_even_when_heartbeat_is_live():
     eng.entropy.book.touch(now)  # websocket heartbeat is current
     assert eng._scan(now) is None
     assert eng._armed["sell_entropy"] is None
+
+
+def test_crossed_book_pause_clears_only_after_a_valid_snapshot():
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.entropy.set_book(101.0, 100.0)
+    eng.hedge.set_book(99.9, 100.0)
+    assert eng._scan(time.time()) is None
+    assert any("crossed_book" in reason
+               for reason in eng._transient_entry_pause_reasons)
+    set_premium(eng, 20.0)
+    assert run_scan(eng) is not None
+    assert not any("crossed_book" in reason
+                   for reason in eng._transient_entry_pause_reasons)
 
 
 def test_scan_keeps_legacy_connection_freshness_when_guard_off():

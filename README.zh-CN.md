@@ -52,11 +52,15 @@ midline − lower  ────────────────────�
 
 Static 模式下，两个方向的门槛都作用于**可实际成交的价格**（Entropy 买一 对 对冲腿卖一，
 反之亦然），并且是**扣除双边吃单手续费之后的净门槛**——引擎会在阈值之上
-另行叠加手续费。因此一次完整往返扣费后**净赚 ≥ upper + lower bps**，这是
-结构上保证的。
+另行叠加手续费。但带宽只是价格比率空间中的信号距离，**不构成往返美元利润
+下限保证**。反例：`midline=5, upper=4, lower=3`，先以
+`Entropy/Hedge=100.091/100` 卖出一单位 Entropy，再在共同价格上涨十倍后以
+`1000/999.801` 反向退出；两个方向都通过门槛，但未计手续费已亏约 `$0.108`。
+滑点、Funding 和 quote/USD 变化还会进一步改变结果。
 
-Static 模式有一点必须理解：当 `midline_bps: 5` 时，买入 Entropy 的门槛是
-`lower − midline`，可能为**负数**。这是有意为之——如果 Entropy 长期贵 5 bps，
+Static 模式有一点必须理解：当 `midline_bps: 5` 时，原始下边界是
+`midline − lower`；实际 BUY-Entropy 方向会换算成精确的 Hedge/Entropy 倒数，
+而不是简单使用 `lower − midline`，换算后的门槛仍可能为**负数**。这是有意为之——如果 Entropy 长期贵 5 bps，
 那么在溢价为 0 时买入它，相对其自身均衡水平就是便宜了 5 bps，这笔交易正是
 此前在 `midline + upper` 处卖出的获利平仓。这同时意味着**中枢填错就是亏钱
 策略**：若真实溢价中枢是 0 而你填了 5，机器人会整天以公允价买入 Entropy。
@@ -117,6 +121,10 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 不带 `--record-only` 运行时，只要两边行情就绪且溢价越过带宽，就会立即
 发送真实订单。
 
+`requirements-live.txt` 只是开发安装入口，不是可复现实盘锁文件：目前包含只有下限
+的依赖，以及指向持续变化的 Lighter SDK GitHub `main`。实盘部署前必须把本地审计过
+的包版本、commit SHA 和制品哈希全部固定。
+
 **仪表盘。** 在终端运行时会显示实时 Rich 仪表盘：两边盘口（含数据龄/点差）、
 持仓与上限、账户权益与本次会话盈亏、两个方向的可成交溢价对比完整门槛
 （已含手续费与库存加价，● 表示已武装）、数据采集进度、最近成交，以及日志
@@ -164,19 +172,19 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `regime.enabled` | 确认状态断裂后暂停新增交易 | `true`（示例配置） |
 | `entropy.dex` | Entropy 在 Hyperliquid 上的 dex 名 | `io` |
 | `*.taker_fee_bps` | 各所吃单费 | 0.0（tradexyz 对冲腿：1.0） |
-| `*.max_position_usd` | 各所持仓上限 | 1000 |
+| `*.max_position_usd` | 各所持仓上限 | 示例为 500 |
 | `*.max_orders_per_min` | 各所每分钟下单预算（滑动 60 秒） | 120；Lighter 对冲腿 30 |
 | `sizing.take_fraction` | 吃掉可套利深度的比例 | 0.5 |
-| `sizing.max_order_notional_usd` | 单笔名义上限 | 500 |
+| `sizing.max_order_notional_usd` | 旧模式单笔名义上限 | 示例为 100 |
 | `sizing.vwap_enabled` | 当前盘口 VWAP 自动仓位；关闭则保留旧逻辑 | `true`（示例配置） |
-| `sizing.min_order_usd` / `max_order_usd` | 自动仓位搜索范围 | 1000 / 50000 |
+| `sizing.min_order_usd` / `max_order_usd` | 自动仓位搜索范围 | 示例为 10 / 100 |
 | `sizing.minimum_net_edge_bps` | 扣除建模成本后的最小方向偏离 | 6 |
 | `sizing.max_vwap_slippage_bps` / `max_book_impact_bps` | 仓位可接受的最大盘口滑点/冲击 | 5 / 5 |
 | `sizing.safety_buffer_bps` / `expected_latency_cost_bps` | 手续费和可见深度之外的显式扣减 | 2 / 0 |
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
 | `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
 | `execution.risk_recovery_enabled` / `hedge_timeout_ms` | 单腿超时恢复 | 示例为 `true` / 250ms |
-| `execution.max_unhedged_delta_usd` | 触发紧急对冲的净敞口阈值 | 5000 |
+| `execution.max_unhedged_delta_usd` | 触发紧急对冲的净敞口阈值 | 示例为 100 |
 | `kill_switch.enabled` | 统一风险事件与持久暂停入口 | `true`（示例配置） |
 | `kill_switch.emergency_flatten_enabled` | 严重持续风险后允许 reduce-only 紧急平仓 | `false` |
 | `accounting.enabled` | 持久化 Pair 台账与重启快照 | `true`（示例配置） |
@@ -195,7 +203,8 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 消息，`market_data.max_book_age_ms` 判断订单簿本身最近是否真正更新。心跳仍在但
 盘口过期时，启用 `enforce_book_age` 后也会禁止新增交易并清除已武装信号。
 
-Hyperliquid `l2Book` 的官方 `time`（毫秒）用于观察交易所到本地的延迟；Lighter
+Hyperliquid `l2Book` 的官方 `time`（毫秒）还会按 `max_book_age_ms` 校验；交易所
+时间已过期的快照和明显来自未来的异常时间戳会被拒绝。Lighter
 官方订单簿 WebSocket 当前未提供服务器时间字段，因此只记录本地接收时间，
 交易所时间保持未知，不用本地时间伪造。成交相关时间同样是程序本地“观察到响应/
 成交”的时间，不等同于交易所撮合引擎内部时间。
@@ -289,9 +298,13 @@ EXIT 数量会被硬限制为当前 Pair 剩余的匹配基础数量，因此回
 不再驱动信号，只保留给 Static 模式兼容使用。
 
 运行时维护 PairPosition（ID、方向、剩余基础数量），启动时也会根据两边匹配持仓
-保守恢复。每次新执行还会创建带事件记录的状态机。启用 `accounting.enabled` 后，
+保守恢复。第一次严格持仓对账发生在策略任务创建前；如果发现单腿或不平衡持仓，
+立即持久暂停 OPEN/ADD 并安排 reduce-only 风险恢复，不会先启动策略再等待风险循环。
+每次新执行还会创建带事件记录的状态机。启用 `accounting.enabled` 后，
 未完成 Pair、最近 200 个已完成 Pair、执行事件、风险事件、持久暂停和待完成紧急
 平仓都会从原子替换的快照恢复；审计事件追加写入 JSONL 并落盘。
+实盘模式强制要求启用该台账；若发现未完成的 `.tmp` 快照，重启会 fail-closed，
+要求人工检查。
 
 ### Pair PnL、Funding 与计价资产 Basis
 
@@ -299,7 +312,8 @@ EXIT 数量会被硬限制为当前 Pair 剩余的匹配基础数量，因此回
 Z-score、中枢、两腿进出场 VWAP、手续费、预计和交易所核对后的资金费、计价币基差
 调整、进出场滑点、进出场市场时段、gross/net PnL、持仓时间、最大不利/有利价差。
 
-资金费读取双方当前费率：Hyperliquid asset context 已是小时费率；Lighter 跨所
+资金费按双方当前费率和每条腿各自的 USD 名义额计算，不会把 USDC、USDG 原始数字
+直接相加。Hyperliquid asset context 已是小时费率；Lighter 跨所
 接口返回 8 小时等效费率，因此程序除以 8。开仓成本按 `expected_holding_hours`
 估算；Pair 持有期间再用账户 funding history 替换为交易所实际支付数据。
 
@@ -311,10 +325,17 @@ Z-score、中枢、两腿进出场 VWAP、手续费、预计和交易所核对�
   - 买入腿 VWAP × 买入计价币/USD
 ```
 
+VWAP 最小/最大订单、两边仓位上限、净 Delta、对账差异、成交量、账户变化和会话
+MTM PnL 使用同一套实时 quote→USD 汇率；各 venue 的 `cash` 仍保留原始计价币，
+只在跨 venue 汇总时换算，避免把 USDG、USDC 数字直接相加。
+
 示例配置从 Coinbase Exchange 的 `ASSET-USD` 一档盘口读取价格。来源缺失或过期会
 禁止 OPEN/ADD；超过 `halt_deviation_bps` 也会暂停新增风险。必须正确设置每条腿的
 `quote_asset`；默认 Entropy/Lighter 主网/trade.xyz 为 USDC，Lighter Robinhood
-为 USDG。
+为 USDG。有效中枢门槛也会按当前方向（反向使用精确倒数）换算到同一 USD 比率，
+避免 USDG/USDC 基差只移动可执行 edge 却不移动门槛。非 USD 计价资产在实盘模式
+必须启用且取得新鲜的 stablecoin 换算数据，否则拒绝启动；换算过期后，账户变化和
+会话 PnL 显示为未知，不会继续把旧的 USDG/USDC 汇率冒充实时 USD 估值。
 
 ## 密钥配置（`.env`，仅实盘需要）
 
@@ -334,6 +355,11 @@ Z-score、中枢、两腿进出场 VWAP、手续费、预计和交易所核对�
 - 两条腿**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
   上异步确认成交；Hyperliquid 用 IOC 限价单同步结算（结果未知时轮询
   orderStatus 兜底）。
+- **未知结果立即 fail-closed**：任一订单结果 unresolved，会在释放两边执行锁前
+  持久暂停 OPEN/ADD。暂停期间只允许持仓对账、EXIT 和 reduce-only 风险恢复；
+  重启不能自动清除。
+- **EXIT 强制 reduce-only**：两条退出腿都传 `reduce_only=true`。本地 Pair 数量
+  即使过期，最坏是交易所拒单或只减少现有仓位，不允许反向开出新仓。
 - **持续性闸门**（`premium_persist_sec`）：信号先"武装"，持续存在才触发，
   过滤单 tick 的假信号。
 - **库存阶梯**：仓位超过上限的 `floor_frac` 后，同方向加仓需要线性递增的
@@ -347,6 +373,9 @@ Z-score、中枢、两腿进出场 VWAP、手续费、预计和交易所核对�
 - **故障隔离**：被限频的交易所短暂暂停；交易所不可达时每
   `venue_probe_sec` 探测。启用 Kill Switch 后，连续执行失败会暂停新增仓位，
   不会继续累积风险。
+- **实际成交均价审计**：Hyperliquid 超时/5xx 后按 exchange order ID 查询成交历史
+  并计算实际 VWAP。若成交数量已知但仍取不到均价，Pair 会写入
+  `accounting_complete=false`，同时持久暂停新增仓位。
 - **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
   其余都是真金白银。
 
@@ -372,8 +401,8 @@ Delta Neutral 的优先级高于套利利润。`UNWINDING` 已纳入状态契约
 风险事件分为 `PAUSE_NEW_ENTRY`、`EMERGENCY_HEDGE` 和
 `EMERGENCY_FLATTEN`，当前覆盖：
 
-- 净敞口超过 `max_unhedged_delta_usd` 且持续超过
-  `max_unhedged_duration_ms`；
+- 净敞口一旦超过 `max_unhedged_delta_usd` 就立即禁止 OPEN/ADD 并请求紧急对冲；
+  持续超过 `max_unhedged_duration_ms` 后转为持久暂停。任一腿无法估值时计时不会重置；
 - 连续不等量成交或部分成交；
 - 连续执行失败；
 - 链上与本地持仓对账不一致；
@@ -385,6 +414,8 @@ Delta Neutral 的优先级高于套利利润。`UNWINDING` 已纳入状态契约
 紧急平仓时才会清除。紧急平仓默认关闭。显式开启后，交易所断连、盘口缺失、锁占用或订单失败会
 保留为持久待办，并每 `emergency_flatten_retry_sec` 重试；最大次数为 0 表示持续
 重试直到已知持仓归零。外部交易所不可用时，任何客户端都无法保证一定成交。
+关闭程序只会有界等待正在执行的订单；超时后会把仍在途的执行持久化为未知状态。
+重启恢复到任何非终态执行记录时，都必须先对账，不能 OPEN/ADD。
 
 在你独立确认两边都已空仓后，可以执行下面的人工复位。该命令会先做实盘持仓对账，
 因此不能与 `--record-only` 一起使用：

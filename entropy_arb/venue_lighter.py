@@ -34,6 +34,8 @@ from .feeds import LighterBookFeed
 log = logging.getLogger("lighter")
 
 OPEN_STATUSES = {"in-progress", "pending", "open"}
+TERMINAL_STATUS_PREFIXES = ("filled", "canceled", "cancelled", "rejected",
+                            "expired")
 AUTH_REFRESH_SEC = 8 * 60
 REST_TIMEOUT = 10.0
 
@@ -78,6 +80,12 @@ class AccountOrdersFeed:
             fut.cancel()
 
     def _resolve(self, coi: int, info: dict) -> None:
+        previous = self._terminal.get(coi)
+        if previous is not None:
+            old_fill = float(previous.get("filled_base") or 0.0)
+            new_fill = float(info.get("filled_base") or 0.0)
+            if new_fill <= old_fill:
+                return
         self._terminal[coi] = info
         while len(self._terminal) > 512:
             self._terminal.popitem(last=False)
@@ -88,19 +96,32 @@ class AccountOrdersFeed:
     def _handle_orders(self, msg: dict) -> None:
         for lst in (msg.get("orders") or {}).values():
             for o in lst or []:
-                status = str(o.get("status", ""))
+                status = str(o.get("status", "")).strip().lower()
                 if status in OPEN_STATUSES:
                     continue
                 try:
                     coi = int(o.get("client_order_index"))
                 except (TypeError, ValueError):
                     continue
-                fb = float(o.get("filled_base_amount") or 0.0)
-                fq = float(o.get("filled_quote_amount") or 0.0)
+                try:
+                    fb = float(o.get("filled_base_amount") or 0.0)
+                    fq = float(o.get("filled_quote_amount") or 0.0)
+                except (TypeError, ValueError):
+                    fb = fq = float("nan")
+                valid_amounts = (math.isfinite(fb) and math.isfinite(fq)
+                                 and fb >= 0 and fq >= 0)
+                avg_px = fq / fb if valid_amounts and fb > 0 else None
+                valid_price = (fb <= 0 or (avg_px is not None
+                                           and math.isfinite(avg_px)
+                                           and avg_px > 0))
+                known_status = status.startswith(TERMINAL_STATUS_PREFIXES)
+                unresolved = not (valid_amounts and valid_price and known_status)
                 self._resolve(coi, {
-                    "status": status, "filled_base": fb,
-                    "filled_quote": fq,
-                    "avg_px": (fq / fb) if fb > 0 else None,
+                    "status": status or "unknown",
+                    "filled_base": fb if valid_amounts else 0.0,
+                    "filled_quote": fq if valid_amounts else 0.0,
+                    "avg_px": avg_px if valid_price else None,
+                    "unresolved": unresolved,
                     "observed_ts": time.time(),
                 })
 
@@ -110,7 +131,7 @@ class AccountOrdersFeed:
             try:
                 auth, err = self.signer.create_auth_token_with_expiry()
                 if err is not None:
-                    raise RuntimeError(f"auth token: {err}")
+                    raise RuntimeError("account websocket auth token failed")
                 connected_at = time.time()
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
@@ -166,6 +187,7 @@ class LighterVenue:
         self.book = OrderBook()
         self.position = 0.0
         self.cash = 0.0
+        self.accounting_complete = True
         self.volume_usd = 0.0     # cumulative filled notional this session
         self.equity = None
         self.free = None
@@ -181,7 +203,7 @@ class LighterVenue:
         self.min_quote = 10.0
         self.signer = None
         self.orders_feed: Optional[AccountOrdersFeed] = None
-        self._coi = int(time.time() * 1000)
+        self._coi = time.time_ns() // 1000
 
     # ------------------------------------------------------------------ REST
 
@@ -233,7 +255,7 @@ class LighterVenue:
         )
         err = signer.check_client()
         if err is not None:
-            raise RuntimeError(f"[{self.name}] API key check failed: {err}")
+            raise RuntimeError(f"[{self.name}] API key check failed")
         self.signer = signer
         log.info("[%s] signer ready (account %d)", self.name, c.account_index)
 
@@ -268,7 +290,8 @@ class LighterVenue:
                                 timeout=aiohttp.ClientTimeout(total=5)) as r:
                 await r.read()
         except Exception as e:
-            log.debug("[%s] signer keepalive failed: %r", self.name, e)
+            log.debug("[%s] signer keepalive failed: %s", self.name,
+                      type(e).__name__)
 
     # ------------------------------------------------------------ price grid
 
@@ -286,6 +309,12 @@ class LighterVenue:
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False) -> dict:
         """Market order with avg-price protection; settle via account ws."""
+        if (not math.isfinite(float(qty)) or qty <= 0
+                or not math.isfinite(float(limit_px)) or limit_px <= 0):
+            return _timed_result({
+                "status": "preflight-rejected", "filled_base": 0.0,
+                "avg_px": None, "err": "qty and limit_px must be finite and > 0",
+                "unresolved": False})
         assert self.signer is not None
         from lighter import SignerClient
         coi = self._next_coi()
@@ -308,24 +337,34 @@ class LighterVenue:
         except Exception as e:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
-            msg = f"{type(e).__name__}: {e}"
-            if getattr(e, "status", None) == 429 or "(429)" in str(e):
+            msg = f"{type(e).__name__} during create_order"
+            if getattr(e, "status", None) == 429:
                 msg = "RATE_LIMITED: " + msg
             return _timed_result(
-                {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                 "err": msg, "unresolved": False},
+                {"status": "send-unknown", "filled_base": 0.0,
+                 "avg_px": None, "err": msg, "unresolved": True},
                 order_send_ts=order_send_ts)
         order_ack_ts = time.time()
-        if err is not None or (getattr(resp, "code", 200) or 200) != 200:
+        try:
+            response_code = int(getattr(resp, "code", None))
+        except (TypeError, ValueError):
+            response_code = None
+        if err is not None or response_code != 200:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
-            msg = str(err) if err is not None else \
-                f"tx rejected code={resp.code} msg={getattr(resp, 'message', None)}"
-            if "rate limit" in msg.lower():
+            msg = (f"{type(err).__name__} returned by create_order"
+                   if err is not None else
+                   f"tx rejected code={response_code} "
+                   "by exchange")
+            if response_code == 429 or "rate limit" in msg.lower():
                 msg = "RATE_LIMITED: " + msg
+            unresolved = (err is not None or response_code is None
+                          or response_code == 408
+                          or response_code >= 500)
             return _timed_result(
-                {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                 "err": msg, "unresolved": False},
+                {"status": ("send-unknown" if unresolved else "send-failed"),
+                 "filled_base": 0.0, "avg_px": None,
+                 "err": msg, "unresolved": unresolved},
                 order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
         if fut is None:
             return _timed_result(
@@ -340,7 +379,7 @@ class LighterVenue:
                 {"status": info["status"],
                  "filled_base": info["filled_base"],
                  "avg_px": info.get("avg_px"), "err": None,
-                 "unresolved": False},
+                 "unresolved": bool(info.get("unresolved"))},
                 order_send_ts=order_send_ts, order_ack_ts=order_ack_ts,
                 fill_ts=fill_ts)
         except asyncio.TimeoutError:

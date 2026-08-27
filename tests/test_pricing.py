@@ -128,3 +128,15 @@ def test_sizing_hard_caps_base_quantity_for_pair_exit():
     assert reason == "ok"
     # Never rounds above the remaining pair position.
     assert result.edge.qty == 2.3
+
+
+def test_sizing_min_max_notional_are_converted_from_quote_to_usd():
+    result, reason = sizing(
+        [(100.0, 10.0)], [(100.1, 10.0)],
+        min_order_usd=10.0, max_order_usd=100.0,
+        size_step=0.1, buy_quote_usd=0.5, sell_quote_usd=0.5)
+    assert reason == "ok"
+    # 1.9 base is 190 quote units but USD 95 at a 0.5 quote rate.
+    approx(result.edge.qty, 1.9)
+    assert result.edge.buy.notional_usd > 100.0
+    assert result.edge.buy.notional_usd * 0.5 <= 100.0

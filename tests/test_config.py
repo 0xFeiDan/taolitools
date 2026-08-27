@@ -58,6 +58,14 @@ def test_example_config_loads():
     assert cfg.stablecoin.enabled is True
     assert cfg.entropy.quote_asset == "USDC"
     assert cfg.hedge.quote_asset == "USDG"
+    assert cfg.premium_persist_sec == 0.3
+    assert cfg.cooldown_sec == 1.0
+    assert cfg.inventory_floor_frac == 0.5
+    assert cfg.entropy.cap_usd == cfg.hedge.cap_usd == 500.0
+    assert cfg.vwap_sizing.min_order_usd == 10.0
+    assert cfg.vwap_sizing.max_order_usd == 100.0
+    assert cfg.execution_risk.max_unhedged_delta_usd == 100.0
+    assert cfg.kill_switch.max_session_loss_usd == 25.0
 
 
 def test_minimal_defaults():
@@ -178,6 +186,64 @@ def test_nonpositive_band():
     expect_error("thresholds:\n"
                  "  midline_bps: 5\n  upper_bps: 0\n  lower_bps: 3\n",
                  "must be > 0")
+
+
+def test_all_numeric_config_values_must_be_finite():
+    expect_error("thresholds:\n"
+                 "  midline_bps: 0\n  upper_bps: .nan\n  lower_bps: 3\n",
+                 "must be finite")
+
+
+def test_static_midline_must_represent_a_positive_price_ratio():
+    expect_error("thresholds:\n"
+                 "  midline_bps: -10000\n  upper_bps: 4\n  lower_bps: 3\n",
+                 "midline_bps")
+    expect_error("thresholds:\n"
+                 "  midline_bps: -9990\n  upper_bps: 4\n  lower_bps: 20\n",
+                 "midline_bps - lower_bps")
+
+
+def test_zero_http_keepalive_is_supported_as_documented():
+    cfg = load(MINIMAL + "\nexecution:\n  http_keepalive_sec: 0\n")
+    assert cfg.http_keepalive_sec == 0
+
+
+def test_market_identifiers_and_lighter_indexes_are_validated(monkeypatch):
+    expect_error(MINIMAL + "\nentropy:\n  dex: xyz\n", "must be 'io'")
+    expect_error(MINIMAL + "\nhedge:\n  quote_asset: 'USDG/../../x'\n",
+                 "quote_asset")
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "not-an-int")
+    expect_error(MINIMAL, "LIGHTER_ACCOUNT_INDEX", hedge="lighter")
+    monkeypatch.setenv("LIGHTER_ACCOUNT_INDEX", "-1")
+    expect_error(MINIMAL, "LIGHTER_ACCOUNT_INDEX", hedge="lighter")
+    expect_error(MINIMAL + "\nexecution:\n  settle_timeout_sec: .inf\n",
+                 "must be finite")
+    expect_error(MINIMAL + "\nentropy:\n  max_position_usd: .nan\n",
+                 "must be finite")
+
+
+def test_execution_fee_position_and_order_bounds_are_validated():
+    expect_error(MINIMAL + "\nentropy:\n  taker_fee_bps: -1\n",
+                 "entropy.taker_fee_bps")
+    expect_error(MINIMAL + "\nhedge:\n  max_position_usd: 0\n",
+                 "hedge.max_position_usd")
+    expect_error(MINIMAL + "\nentropy:\n  max_orders_per_min: 0\n",
+                 "entropy.max_orders_per_min")
+    expect_error(MINIMAL + "\nsizing:\n"
+                 "  min_order_notional_usd: 100\n"
+                 "  max_order_notional_usd: 10\n",
+                 "min_order_notional_usd")
+    expect_error(MINIMAL + "\ninventory:\n  floor_frac: 1.1\n",
+                 "inventory.floor_frac")
+    expect_error(MINIMAL + "\nexecution:\n  leg_slippage_bps: 10000\n",
+                 "leg_slippage_bps")
+    expect_error("thresholds:\n"
+                 "  midline_bps: 5\n  upper_bps: 100001\n  lower_bps: 3\n",
+                 "upper_bps")
+    expect_error(MINIMAL + "\nentropy:\n  max_position_usd: 1000000000001\n",
+                 "max_position_usd")
+    expect_error(MINIMAL + "\nexecution:\n  staleness_sec: 31536001\n",
+                 "staleness_sec")
 
 
 def test_v2_validation():

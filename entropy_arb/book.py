@@ -80,6 +80,8 @@ class OrderBook:
         for name, side in (("bids", self.bids), ("asks", self.asks)):
             for lvl in ob.get(name) or []:
                 px, sz = float(lvl["price"]), float(lvl["size"])
+                if not (math.isfinite(px) and math.isfinite(sz) and px > 0):
+                    continue
                 if sz <= 0:
                     side.pop(px, None)
                 else:
@@ -89,10 +91,15 @@ class OrderBook:
     # ---- Hyperliquid full snapshot ----
     def apply_hl(self, levels: list, *, received_ts: Optional[float] = None,
                  exchange_ts: Optional[float] = None) -> None:
-        self.bids = {float(l["px"]): float(l["sz"])
-                     for l in levels[0] if float(l["sz"]) > 0}
-        self.asks = {float(l["px"]): float(l["sz"])
-                     for l in levels[1] if float(l["sz"]) > 0}
+        def clean(raw):
+            parsed = ((float(level["px"]), float(level["sz"]))
+                      for level in raw)
+            return {px: size for px, size in parsed
+                    if (math.isfinite(px) and math.isfinite(size)
+                        and px > 0 and size > 0)}
+
+        self.bids = clean(levels[0])
+        self.asks = clean(levels[1])
         self._mark_book_update(received_ts, exchange_ts)
 
     def sorted_bids(self) -> List[Level]:
@@ -144,12 +151,18 @@ class OrderBook:
             return BookQuality(False, "not_ready", **common)
         if not self.bids or not self.asks:
             return BookQuality(False, "empty_book", **common)
+        if self.best_bid() >= self.best_ask():
+            return BookQuality(False, "crossed_book", **common)
         if message_age is None \
                 or message_age > max_connection_age_sec * 1000.0:
             return BookQuality(False, "connection_stale", **common)
         if max_book_age_ms is not None \
                 and (book_age is None or book_age > max_book_age_ms):
             return BookQuality(False, "book_stale", **common)
+        if max_book_age_ms is not None \
+                and common["exchange_lag_ms"] is not None \
+                and common["exchange_lag_ms"] > max_book_age_ms:
+            return BookQuality(False, "exchange_stale", **common)
         return BookQuality(True, "ok", **common)
 
     def is_fresh(self, max_age_sec: float) -> bool:
@@ -203,6 +216,19 @@ def walk_depth(levels: List[Level], qty: float) -> Tuple[float, float]:
         if remaining <= 1e-12:
             break
     return marginal_px, notional
+
+
+def qty_within_notional(levels: List[Level], cap: float) -> float:
+    """Maximum visible base quantity whose walked notional stays under cap."""
+    remaining_notional = cap
+    qty = 0.0
+    for px, size in levels:
+        take = min(size, remaining_notional / px)
+        qty += take
+        remaining_notional -= take * px
+        if remaining_notional <= 1e-9:
+            break
+    return qty
 
 
 @dataclass
@@ -264,6 +290,20 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     clears both venues' taker fees plus threshold_bps. Returns
     (ArbPlan | None, reason).
     """
+    numeric = (
+        threshold_bps, buy_fee_bps, sell_fee_bps, take_fraction,
+        cap_notional, min_base, min_notional, size_step)
+    if not all(math.isfinite(float(value)) for value in numeric):
+        raise ValueError("all planner inputs must be finite")
+    if not 0 < take_fraction <= 1:
+        raise ValueError("take_fraction must be in (0, 1]")
+    if cap_notional <= 0 or size_step <= 0:
+        raise ValueError("cap_notional and size_step must be > 0")
+    if min_base < 0 or min_notional < 0:
+        raise ValueError("minimum size/notional must be >= 0")
+    if not (0 <= buy_fee_bps < 10000
+            and 0 <= sell_fee_bps < 10000):
+        raise ValueError("fee bps must be in [0, 10000)")
     asks = buy_book.sorted_asks()
     bids = sell_book.sorted_bids()
     if not asks or not bids:
@@ -277,7 +317,9 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     q_max, q_max_notional = crossable_base(asks, bids, threshold, buy_fee, sell_fee)
     if q_max <= 0:
         return None, "no_edge"
-    target = min(q_max * take_fraction, cap_notional / asks[0][0])
+    target = min(q_max * take_fraction,
+                 qty_within_notional(asks, cap_notional),
+                 qty_within_notional(bids, cap_notional))
     if max_base is not None:
         target = min(target, max_base)
     target = floor_step(target, size_step)
@@ -323,6 +365,9 @@ def plan_vwap_arb(
         min_base: float, size_step: float,
         max_base: Optional[float] = None,
         funding_cost_bps: float = 0.0,
+        buy_funding_rate: Optional[float] = None,
+        sell_funding_rate: Optional[float] = None,
+        expected_holding_hours: float = 0.0,
         buy_quote_usd: float = 1.0, sell_quote_usd: float = 1.0):
     """Build an ``ArbPlan`` from current-book VWAP binary sizing."""
     from .pricing import find_max_executable_size
@@ -341,6 +386,9 @@ def plan_vwap_arb(
         safety_buffer_bps=safety_buffer_bps,
         expected_latency_cost_bps=expected_latency_cost_bps,
         funding_cost_bps=funding_cost_bps,
+        buy_funding_rate=buy_funding_rate,
+        sell_funding_rate=sell_funding_rate,
+        expected_holding_hours=expected_holding_hours,
         buy_quote_usd=buy_quote_usd,
         sell_quote_usd=sell_quote_usd,
     )
@@ -351,10 +399,11 @@ def plan_vwap_arb(
         qty=edge.qty,
         buy_limit=edge.buy.worst_px,
         sell_limit=edge.sell.worst_px,
-        buy_notional=edge.buy.notional_usd,
-        sell_notional=edge.sell.notional_usd,
+        buy_notional=edge.buy.notional_usd * buy_quote_usd,
+        sell_notional=edge.sell.notional_usd * sell_quote_usd,
         q_max=result.search_upper_qty,
-        q_max_notional=result.search_upper_qty * asks[0][0],
+        q_max_notional=(result.search_upper_qty * asks[0][0]
+                        * buy_quote_usd),
         top_premium_bps=(bids[0][0] / asks[0][0] - 1.0) * 1e4,
         marginal_premium_bps=(edge.sell.worst_px / edge.buy.worst_px
                               - 1.0) * 1e4,

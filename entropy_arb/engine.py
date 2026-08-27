@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -63,6 +64,10 @@ CSV_HEADER = ["ts", "direction", "buy_venue", "sell_venue", "qty",
               "inv_add_bps", "ok", "buy_fill", "sell_fill",
               "buy_status", "sell_status", "fill_edge_usd"]
 BALANCE_POLL_SEC = 30.0
+TERMINAL_ORDER_STATUS_PREFIXES = (
+    "filled", "canceled", "cancelled", "rejected", "expired",
+    "send-failed", "preflight-rejected",
+)
 
 
 class Engine:
@@ -119,10 +124,12 @@ class Engine:
         self._unmatched_legs: Dict[str, dict] = {}
         self.risk_events: deque = deque(maxlen=200)
         self._entry_pause_reasons: set[str] = set()
+        self._transient_entry_pause_reasons: set[str] = set()
         self._active_risk_triggers: set[str] = set()
         self.consecutive_partial_fills = 0
         self._unhedged_since: Optional[float] = None
         self._flatten_required = False
+        self._flatten_lock = asyncio.Lock()
         self._flatten_attempts = 0
         self._next_flatten_at = 0.0
         self._cost_pause_trigger: Optional[str] = None
@@ -200,6 +207,16 @@ class Engine:
                     updated_at=float(raw["updated_at"]), events=events))
             except (KeyError, TypeError, ValueError):
                 continue
+        if any(item.state in {
+                ExecutionState.ORDERS_SENT, ExecutionState.PARTIAL,
+                ExecutionState.BOTH_FILLED, ExecutionState.RECOVERY,
+                ExecutionState.HEDGED, ExecutionState.UNWINDING,
+        } for item in self.execution_history):
+            # A crash can happen after network dispatch but before a terminal
+            # result or pause event is durably recorded. The non-terminal
+            # execution record is itself sufficient evidence of ambiguity.
+            self._entry_pause_reasons.add("restart_inflight_execution")
+            self._active_risk_triggers.add("restart_inflight_execution")
 
     def _runtime_state(self) -> dict:
         executions = []
@@ -233,8 +250,53 @@ class Engine:
         }
 
     def _persist_runtime(self) -> None:
-        if self.ledger is not None:
+        if self.ledger is None:
+            return
+        try:
             self.ledger.snapshot(self._runtime_state())
+        except Exception as exc:
+            self._mark_persistence_failure(exc)
+
+    def _mark_persistence_failure(self, exc: BaseException) -> None:
+        # Persistence is itself a risk control. Keep risk-reducing tasks
+        # alive, but permanently stop strategy entry in this process.
+        self.halted = True
+        self._entry_pause_reasons.add("persistence_failure")
+        self._active_risk_triggers.add("persistence_failure")
+        log.critical("[RISK] persistence failure; OPEN/ADD halted: %r", exc)
+
+    def _require_live_persistence(self) -> None:
+        if not self.record_only and self.ledger is None:
+            raise RuntimeError(
+                "live trading requires accounting.enabled: true so unknown "
+                "orders and recovery state survive restart")
+        if (not self.record_only
+                and any(venue.quote_asset != "USD"
+                        for venue in (self.cfg.entropy, self.cfg.hedge))
+                and not self.cfg.stablecoin.enabled):
+            raise RuntimeError(
+                "live trading with non-USD quote assets requires fresh "
+                "stablecoin USD conversion; enable stablecoin and VWAP sizing")
+
+    async def _wait_for_inflight_shutdown(
+            self, timeout: Optional[float] = None) -> set[asyncio.Task]:
+        """Bound shutdown while persisting ambiguity before tasks are lost."""
+        if not self._exec_tasks:
+            return set()
+        log.info("waiting for %d in-flight execution(s) to settle",
+                 len(self._exec_tasks))
+        _, pending = await asyncio.wait(
+            self._exec_tasks,
+            timeout=(self.cfg.settle_timeout_sec + 2.0
+                     if timeout is None else timeout))
+        if pending:
+            self._risk_event(
+                "shutdown_inflight_unknown", RiskAction.PAUSE_NEW_ENTRY,
+                f"shutdown timed out with {len(pending)} execution task(s) "
+                "still unresolved; startup reconciliation required",
+                persistent=True)
+            self._reconcile_evt.set()
+        return set(pending)
 
     def _clear_persistent_risk_if_safe(self) -> None:
         if not self.clear_risk_pause_requested:
@@ -256,6 +318,18 @@ class Engine:
         self._persist_runtime()
         log.warning("operator cleared persisted risk pauses while flat: %s",
                     cleared or "none")
+
+    def _guard_startup_positions(self) -> None:
+        """Fail closed before strategy tasks exist when startup is unhedged."""
+        net = sum(venue.position for venue in self.venues.values())
+        if abs(net) <= self.cfg.net_tolerance_base:
+            return
+        self._risk_event(
+            "startup_unhedged_position", RiskAction.PAUSE_NEW_ENTRY,
+            "startup positions are not delta neutral; reconcile/hedge required",
+            observed_value=abs(net), threshold=self.cfg.net_tolerance_base,
+            persistent=True)
+        self._reconcile_evt.set()
 
     # ------------------------------------------------------------- utilities
 
@@ -283,6 +357,111 @@ class Engine:
 
     def _record_send(self, v) -> None:
         self._sends.setdefault(v.key, deque()).append(time.time())
+
+    @staticmethod
+    def _consume_background_order(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _send_bounded(self, venue, *, is_buy: bool, qty: float,
+                            limit_px: float, reduce_only: bool) -> object:
+        """Bound every adapter call; timeout means UNKNOWN, never no-fill."""
+        task = asyncio.create_task(venue.send_taker(
+            is_buy=is_buy, qty=qty, limit_px=limit_px,
+            reduce_only=reduce_only))
+        self._exec_tasks.add(task)
+        task.add_done_callback(self._exec_tasks.discard)
+        task.add_done_callback(self._consume_background_order)
+        done, pending = await asyncio.wait(
+            {task}, timeout=self.cfg.settle_timeout_sec)
+        if pending:
+            task.cancel()
+            return {
+                "status": "engine-timeout", "filled_base": 0.0,
+                "avg_px": None,
+                "err": "order response unresolved at engine timeout",
+                "unresolved": True, "accounting_complete": False,
+            }
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            return {
+                "status": "engine-cancelled", "filled_base": 0.0,
+                "avg_px": None,
+                "err": "order response cancelled before resolution",
+                "unresolved": True, "accounting_complete": False,
+            }
+        except Exception as exc:
+            return exc
+
+    def _normalize_order_result(self, raw, requested_qty: float, *,
+                                venue_key: str, pair_id: Optional[str] = None
+                                ) -> dict:
+        """Validate untrusted adapter output before it reaches accounting."""
+        if not isinstance(raw, dict):
+            raw = {
+                "status": "adapter-exception", "filled_base": 0.0,
+                "avg_px": None,
+                "err": f"{type(raw).__name__} from venue adapter",
+                "unresolved": True,
+            }
+        info = dict(raw)
+        invalid = False
+        try:
+            filled = float(info.get("filled_base") or 0.0)
+        except (TypeError, ValueError):
+            filled = 0.0
+            invalid = True
+        tolerance = max(self._step / 2.0, 1e-12)
+        if (not math.isfinite(filled) or filled < 0
+                or filled > requested_qty + tolerance):
+            filled = 0.0
+            invalid = True
+        avg_raw = info.get("avg_px")
+        avg_px = None
+        if avg_raw not in (None, ""):
+            try:
+                avg_px = float(avg_raw)
+            except (TypeError, ValueError):
+                avg_px = None
+            if avg_px is None or not math.isfinite(avg_px) or avg_px <= 0:
+                avg_px = None
+                if filled > 0:
+                    info["accounting_complete"] = False
+        if invalid:
+            info.update({
+                "status": "invalid-result", "filled_base": 0.0,
+                "avg_px": None, "unresolved": True,
+                "accounting_complete": False,
+            })
+            self._risk_event(
+                "invalid_order_result", RiskAction.PAUSE_NEW_ENTRY,
+                f"{venue_key} returned an invalid fill quantity",
+                pair_id=pair_id, persistent=True)
+        else:
+            info["filled_base"] = filled
+            info["avg_px"] = avg_px
+            status = str(info.get("status", "unknown")).strip().lower()
+            terminal = status.startswith(TERMINAL_ORDER_STATUS_PREFIXES)
+            info["unresolved"] = (bool(info.get("unresolved"))
+                                  or not terminal)
+            if filled > 0 and avg_px is None:
+                info["accounting_complete"] = False
+        info.setdefault("status", "unknown")
+        info.setdefault("err", None)
+        for key in ("order_send_ts", "order_ack_ts", "first_fill_ts",
+                    "final_fill_ts"):
+            value = info.get(key)
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = None
+            info[key] = value if value is not None and math.isfinite(value) else None
+        return info
 
     def _book_quality(self, v, now: Optional[float] = None):
         max_book_age_ms = (self.cfg.market_data.max_book_age_ms
@@ -418,6 +597,9 @@ class Engine:
                 return "regime:" + ",".join(status.reasons)
         if self._entry_pause_reasons:
             return "kill:" + ",".join(sorted(self._entry_pause_reasons))
+        if self._transient_entry_pause_reasons:
+            return "risk:" + ",".join(
+                sorted(self._transient_entry_pause_reasons))
         cost_reason = self.costs.pause_reason()
         if cost_reason is not None:
             return "cost:" + cost_reason
@@ -438,6 +620,9 @@ class Engine:
         self.risk_events.append(event)
         if persistent or action is RiskAction.EMERGENCY_FLATTEN:
             self._entry_pause_reasons.add(trigger)
+        elif action in (RiskAction.PAUSE_NEW_ENTRY,
+                         RiskAction.EMERGENCY_HEDGE):
+            self._transient_entry_pause_reasons.add(trigger)
         log.critical("[RISK] %s -> %s: %s (value=%s threshold=%s pair=%s)",
                      trigger, action.value, reason, observed_value, threshold,
                      pair_id or "—")
@@ -447,6 +632,7 @@ class Engine:
         if trigger not in self._entry_pause_reasons:
             removed = trigger in self._active_risk_triggers
             self._active_risk_triggers.discard(trigger)
+            self._transient_entry_pause_reasons.discard(trigger)
             if removed:
                 self._persist_runtime()
 
@@ -476,6 +662,7 @@ class Engine:
 
     async def _run_inner(self) -> None:
         cfg = self.cfg
+        self._require_live_persistence()
         self.entropy = self._make_venue(cfg.entropy)
         self.hedge = self._make_venue(cfg.hedge)
         self.venues = {"entropy": self.entropy, "hedge": self.hedge}
@@ -523,6 +710,7 @@ class Engine:
             log.warning("LIVE — real orders will be sent (use --record-only "
                         "for credential-less data collection)")
             await self._reconcile_positions(hedge=False, strict=True)
+            self._guard_startup_positions()
             self._clear_persistent_risk_if_safe()
             log.info("starting positions: %s (net %+.6g)",
                      " ".join(f"{v.name}={v.position:+.6g}"
@@ -557,11 +745,7 @@ class Engine:
                                              name="reconcile"))
 
         await self.stop.wait()
-        if self._exec_tasks:  # let in-flight executions settle, never cancel
-            log.info("waiting for %d in-flight execution(s) to settle",
-                     len(self._exec_tasks))
-            await asyncio.wait(self._exec_tasks,
-                               timeout=cfg.settle_timeout_sec + 2.0)
+        await self._wait_for_inflight_shutdown()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -590,7 +774,7 @@ class Engine:
             ref = v.book.mid()
             if ref is None:
                 return 0.0
-            u = min(abs(v.position) * ref / v.cap_usd, 1.0)
+            u = min(self._notional_usd(v, v.position, ref) / v.cap_usd, 1.0)
             if u <= floor:
                 return 0.0
             return scale * (u - floor) / (1.0 - floor)
@@ -601,12 +785,14 @@ class Engine:
         """Net hurdle (bps, on top of fees) for the direction buy->sell.
 
         selling entropy: executable premium must clear midline + upper;
-        buying entropy: the reverse premium must clear lower - midline."""
-        if sell.key == "entropy":
-            base = self.active_midline_bps() + self.cfg.upper_bps
-        else:
-            base = self.cfg.lower_bps - self.active_midline_bps()
-        return base + self._inv_add_bps(buy, sell)
+        buying entropy: the raw lower boundary is converted by reciprocal."""
+        deviation = ((self.cfg.upper_bps if sell.key == "entropy"
+                      else self.cfg.lower_bps)
+                     + self._inv_add_bps(buy, sell))
+        raw_target = (self.active_midline_bps() + deviation
+                      if sell.key == "entropy" else
+                      self.active_midline_bps() - deviation)
+        return self._directional_midline_usd(buy, sell, raw_target)
 
     @staticmethod
     def _pair_direction_for_key(direction_key: str) -> PairDirection:
@@ -621,6 +807,17 @@ class Engine:
         if self.pair_position.direction is direction:
             return SignalAction.ADD
         return SignalAction.EXIT
+
+    def _closeable_pair_base(self) -> float:
+        if not self.pair_position.is_open:
+            return 0.0
+        if self.pair_position.direction is PairDirection.SELL_ENTROPY:
+            venue_base = min(max(-self.entropy.position, 0.0),
+                             max(self.hedge.position, 0.0))
+        else:
+            venue_base = min(max(self.entropy.position, 0.0),
+                             max(-self.hedge.position, 0.0))
+        return max(min(self.pair_position.base_qty, venue_base), 0.0)
 
     def _dynamic_signal_context(self, buy, sell, direction_key: str):
         """Return (action, required net edge bps, max base) or None."""
@@ -648,9 +845,11 @@ class Engine:
                 + self._inv_add_bps(buy, sell),
                 self.cfg.vwap_sizing.minimum_net_edge_bps
                 if self.cfg.vwap_sizing.enabled else 0.0)
-            required = (stats.slow_midline_bps + deviation
-                        if direction is PairDirection.SELL_ENTROPY
-                        else -stats.slow_midline_bps + deviation)
+            raw_target = (stats.slow_midline_bps + deviation
+                          if sell.key == "entropy" else
+                          stats.slow_midline_bps - deviation)
+            required = self._directional_midline_usd(
+                buy, sell, raw_target)
             return action, required, None
 
         # EXIT always reduces the currently tracked opposite pair. Its edge
@@ -659,20 +858,34 @@ class Engine:
                      else z <= exit_z)
         if not qualifies:
             return None
-        if self.pair_position.direction is PairDirection.SELL_ENTROPY:
-            reducible = min(max(-self.entropy.position, 0.0),
-                            max(self.hedge.position, 0.0))
-        else:
-            reducible = min(max(self.entropy.position, 0.0),
-                            max(-self.hedge.position, 0.0))
-        max_exit_base = min(self.pair_position.base_qty, reducible)
+        max_exit_base = self._closeable_pair_base()
         if max_exit_base < self._min_base:
             return None
-        required = (stats.slow_midline_bps - exit_z * stats.volatility_bps
-                    if direction is PairDirection.SELL_ENTROPY
-                    else -stats.slow_midline_bps
-                    - exit_z * stats.volatility_bps)
+        exit_deviation = exit_z * stats.volatility_bps
+        raw_target = (stats.slow_midline_bps - exit_deviation
+                      if sell.key == "entropy" else
+                      stats.slow_midline_bps + exit_deviation)
+        required = self._directional_midline_usd(buy, sell, raw_target)
         return action, required, max_exit_base
+
+    def _directional_midline_usd(self, buy, sell,
+                                 entropy_midline_bps: float) -> float:
+        """Convert the Entropy/hedge raw midline into this leg direction.
+
+        The reverse direction is a reciprocal, not simply ``-midline``. Quote
+        assets are then converted to USD so a USDG/USDC basis cannot shift the
+        executable edge while leaving the hurdle in raw quote units.
+        """
+        entropy_hedge_ratio = 1.0 + entropy_midline_bps / 1e4
+        if (not math.isfinite(entropy_hedge_ratio)
+                or entropy_hedge_ratio <= 0):
+            raise ValueError("midline implies a non-positive price ratio")
+        raw_direction_ratio = (entropy_hedge_ratio
+                               if sell.key == "entropy"
+                               else 1.0 / entropy_hedge_ratio)
+        adjusted_ratio = (raw_direction_ratio * self._quote_rate(sell)
+                          / self._quote_rate(buy))
+        return (adjusted_ratio - 1.0) * 1e4
 
     def _vwap_required_net_edge(self, buy, sell) -> float:
         """Absolute directional hurdle after all modeled execution costs.
@@ -682,19 +895,31 @@ class Engine:
         mean-reversion semantics when the normal cross-venue basis is nonzero.
         """
         inv = self._inv_add_bps(buy, sell)
-        if sell.key == "entropy":
-            directional_midline = self.active_midline_bps()
-            configured_band = self.cfg.upper_bps
-        else:
-            directional_midline = -self.active_midline_bps()
-            configured_band = self.cfg.lower_bps
+        configured_band = (self.cfg.upper_bps if sell.key == "entropy"
+                           else self.cfg.lower_bps)
         deviation = max(configured_band + inv,
                         self.cfg.vwap_sizing.minimum_net_edge_bps)
-        return directional_midline + deviation
+        raw_target = (self.active_midline_bps() + deviation
+                      if sell.key == "entropy" else
+                      self.active_midline_bps() - deviation)
+        return self._directional_midline_usd(buy, sell, raw_target)
 
-    def _headroom(self, buy, sell, ref_px: float) -> float:
-        hb = buy.cap_usd - buy.position * ref_px
-        hs = sell.cap_usd + sell.position * ref_px
+    def _quote_rate(self, venue) -> float:
+        try:
+            return self.costs.quote_rate(venue.key)
+        except KeyError:
+            # Missing enabled cost data already blocks OPEN/ADD. Risk-reducing
+            # EXIT/hedge paths still need an executable fallback.
+            return 1.0
+
+    def _notional_usd(self, venue, qty: float, price: float) -> float:
+        return abs(qty * price) * self._quote_rate(venue)
+
+    def _headroom(self, buy, sell, buy_px: float, sell_px: float) -> float:
+        hb = (buy.cap_usd
+              - buy.position * buy_px * self._quote_rate(buy))
+        hs = (sell.cap_usd
+              + sell.position * sell_px * self._quote_rate(sell))
         return min(hb, hs)
 
     def _plan(self, buy, sell, cap_notional: float, *,
@@ -709,12 +934,19 @@ class Engine:
             try:
                 funding_cost = (self.costs.funding_cost_bps(direction)
                                 if action is not SignalAction.EXIT else 0.0)
+                buy_funding_rate = (
+                    self.costs.funding_rate(buy.key)
+                    if action is not SignalAction.EXIT else None)
+                sell_funding_rate = (
+                    self.costs.funding_rate(sell.key)
+                    if action is not SignalAction.EXIT else None)
                 buy_quote_usd = self.costs.quote_rate(buy.key)
                 sell_quote_usd = self.costs.quote_rate(sell.key)
             except KeyError:
                 # Missing enabled cost data already blocks OPEN/ADD via
                 # strategy_pause_reason. EXIT remains available for safety.
                 funding_cost = 0.0
+                buy_funding_rate = sell_funding_rate = None
                 buy_quote_usd = sell_quote_usd = 1.0
             result = plan_vwap_arb(
                 buy.book, sell.book,
@@ -722,8 +954,10 @@ class Engine:
                     self._vwap_required_net_edge(buy, sell)
                     if required_edge_bps is None else required_edge_bps),
                 buy_fee_bps=buy.fee_bps, sell_fee_bps=sell.fee_bps,
-                min_order_usd=max(sizing.min_order_usd,
-                                  self._min_notional),
+                min_order_usd=max(
+                    sizing.min_order_usd, self.cfg.min_order_notional,
+                    buy.min_quote * buy_quote_usd,
+                    sell.min_quote * sell_quote_usd),
                 max_order_usd=min(sizing.max_order_usd, cap_notional),
                 max_vwap_slippage_bps=sizing.max_vwap_slippage_bps,
                 max_book_impact_bps=sizing.max_book_impact_bps,
@@ -732,6 +966,11 @@ class Engine:
                 min_base=self._min_base, size_step=self._step,
                 max_base=max_base,
                 funding_cost_bps=funding_cost,
+                buy_funding_rate=buy_funding_rate,
+                sell_funding_rate=sell_funding_rate,
+                expected_holding_hours=(
+                    self.cfg.funding.expected_holding_hours
+                    if buy_funding_rate is not None else 0.0),
                 buy_quote_usd=buy_quote_usd,
                 sell_quote_usd=sell_quote_usd,
             )
@@ -822,7 +1061,15 @@ class Engine:
               for venue in self.venues.values()), return_exceptions=True)
         if any(isinstance(result, BaseException) for result in results):
             return
-        pair.set_realized_funding(sum(float(result) for result in results))
+        try:
+            funding_usd = sum(
+                float(result) * self.costs.quote_rate(venue.key)
+                for venue, result in zip(self.venues.values(), results))
+        except (KeyError, TypeError, ValueError):
+            return
+        if not math.isfinite(funding_usd):
+            return
+        pair.set_realized_funding(funding_usd)
         if self.ledger is not None:
             self.ledger.append_event("PAIR_FUNDING", {
                 "pair_id": pair.pair_id, "funding": pair.funding,
@@ -872,7 +1119,12 @@ class Engine:
         mids = [v.book.mid() for v in self.venues.values()]
         if not mids or any(mid is None for mid in mids):
             return None
-        reference = sum(mids) / len(mids)
+        try:
+            reference = sum(
+                mid * self.costs.quote_rate(venue.key)
+                for venue, mid in zip(self.venues.values(), mids)) / len(mids)
+        except KeyError:
+            return None
         return abs(sum(v.position for v in self.venues.values())) * reference
 
     async def _risk_check_once(self) -> None:
@@ -883,21 +1135,33 @@ class Engine:
                      or self._flatten_attempts
                      < self.cfg.kill_switch.emergency_flatten_max_attempts)):
             await self._emergency_flatten()
+        net_base = abs(sum(v.position for v in self.venues.values()))
         net_usd = self._net_delta_usd()
         threshold = self.cfg.execution_risk.max_unhedged_delta_usd
-        if net_usd is not None and net_usd > threshold:
+        unpriced_delta = (net_usd is None
+                          and net_base > self.cfg.net_tolerance_base)
+        if unpriced_delta or (net_usd is not None and net_usd > threshold):
             if self._unhedged_since is None:
                 self._unhedged_since = now
                 self._risk_event(
                     "net_delta_limit", RiskAction.EMERGENCY_HEDGE,
-                    "net delta exceeded recovery threshold",
-                    observed_value=net_usd, threshold=threshold)
+                    ("net delta cannot be valued because required market/cost "
+                     "data is unavailable" if unpriced_delta else
+                     "net delta exceeded recovery threshold"),
+                    observed_value=(net_base if unpriced_delta else net_usd),
+                    threshold=(self.cfg.net_tolerance_base
+                               if unpriced_delta else threshold))
             await self._maybe_hedge()
             self._sync_pair_position_from_venues()
             self._settle_recovery_executions()
             remaining = self._net_delta_usd()
-            if (self.cfg.kill_switch.enabled and remaining is not None
-                    and remaining > threshold
+            remaining_base = abs(sum(v.position for v in self.venues.values()))
+            remaining_unpriced = (remaining is None and remaining_base
+                                  > self.cfg.net_tolerance_base)
+            still_unhedged = (remaining_unpriced
+                              or (remaining is not None
+                                  and remaining > threshold))
+            if (self.cfg.kill_switch.enabled and still_unhedged
                     and (now - self._unhedged_since) * 1000.0
                     >= self.cfg.kill_switch.max_unhedged_duration_ms):
                 self._risk_event(
@@ -936,6 +1200,12 @@ class Engine:
 
     async def _emergency_flatten(self) -> bool:
         """Retryable reduce-only flatten of every known venue position."""
+        if self._flatten_lock.locked():
+            return False
+        async with self._flatten_lock:
+            return await self._emergency_flatten_locked()
+
+    async def _emergency_flatten_locked(self) -> bool:
         self._flatten_required = True
         self._flatten_attempts += 1
         self._next_flatten_at = (time.time()
@@ -944,6 +1214,12 @@ class Engine:
         flatten_fills = []
         for venue in self.venues.values():
             position = venue.position
+            if not math.isfinite(float(position)):
+                errors.append(f"{venue.key}:invalid_position")
+                self._risk_event(
+                    "invalid_position_state", RiskAction.PAUSE_NEW_ENTRY,
+                    f"{venue.name} position is not finite", persistent=True)
+                continue
             if abs(position) < venue.min_base:
                 continue
             lock = self._vlock(venue.key)
@@ -952,30 +1228,66 @@ class Engine:
                 continue
             is_buy = position < 0
             ref = venue.book.best_ask() if is_buy else venue.book.best_bid()
-            if ref is None:
+            if ref is None or not math.isfinite(float(ref)) or ref <= 0:
                 errors.append(f"{venue.key}:no_book")
                 continue
             slip = self.cfg.hedge_slippage_bps / 1e4
             limit = venue.px_round(ref * (1 + slip), True) if is_buy else \
                 venue.px_round(ref * (1 - slip), False)
             qty = floor_step(abs(position), self._step)
+            if (qty < venue.min_base or not math.isfinite(qty)
+                    or not math.isfinite(limit) or limit <= 0):
+                errors.append(f"{venue.key}:invalid_order")
+                continue
+            minimum_quote = max(
+                venue.min_quote,
+                self.cfg.min_order_notional / self._quote_rate(venue))
+            if qty * limit < minimum_quote:
+                errors.append(f"{venue.key}:below_min_notional")
+                continue
             await lock.acquire()
             try:
                 self._record_send(venue)
-                info = await venue.send_taker(
-                    is_buy=is_buy, qty=qty, limit_px=limit, reduce_only=True)
+                try:
+                    raw = await self._send_bounded(
+                        venue,
+                        is_buy=is_buy, qty=qty, limit_px=limit,
+                        reduce_only=True)
+                except Exception as exc:
+                    raw = exc
+                info = self._normalize_order_result(
+                    raw, qty, venue_key=venue.key,
+                    pair_id=self.pair_position.pair_id)
                 if not info.get("err") and not info.get("unresolved"):
                     fill = info.get("filled_base", 0.0)
                     venue.position += fill if is_buy else -fill
                     if fill:
-                        px = info.get("avg_px") or limit
-                        fee = venue.fee_bps / 1e4
-                        venue.cash += (-fill * px * (1 + fee) if is_buy
-                                       else fill * px * (1 - fee))
-                        venue.volume_usd += fill * px
-                        flatten_fills.append((venue, is_buy, fill, px))
+                        px = info.get("avg_px")
+                        if px is None:
+                            venue.accounting_complete = False
+                            self._risk_event(
+                                "incomplete_fill_accounting",
+                                RiskAction.PAUSE_NEW_ENTRY,
+                                "emergency fill has no actual average price",
+                                pair_id=self.pair_position.pair_id,
+                                persistent=True)
+                        else:
+                            fee = venue.fee_bps / 1e4
+                            venue.cash += (-fill * px * (1 + fee) if is_buy
+                                           else fill * px * (1 - fee))
+                            venue.volume_usd += self._notional_usd(
+                                venue, fill, px)
+                            flatten_fills.append((venue, is_buy, fill, px))
                 else:
                     errors.append(f"{venue.key}:order_failed")
+                    if info.get("unresolved"):
+                        self._risk_event(
+                            "unknown_risk_order_outcome",
+                            RiskAction.PAUSE_NEW_ENTRY,
+                            "emergency flatten order outcome is unknown",
+                            pair_id=self.pair_position.pair_id,
+                            persistent=True)
+                        self._reconcile_evt.set()
             finally:
                 lock.release()
         if self.ledger is not None and self.ledger.current is not None:
@@ -1061,12 +1373,9 @@ class Engine:
 
     async def _evaluate(self) -> None:
         cfg = self.cfg
-        if self.halted:
+        if self.halted and not self.pair_position.is_open:
             return
         now = time.time()
-        if now - self.last_trade_ts < cfg.cooldown_sec:
-            self._schedule_poke(cfg.cooldown_sec - (now - self.last_trade_ts))
-            return
         best = self._scan(now)
         if best is None:
             return
@@ -1095,10 +1404,21 @@ class Engine:
         try:
             unresolved = await self._execute(
                 buy, sell, plan, signal_ts=signal_ts)
+            if unresolved:
+                self._risk_event(
+                    "unresolved_order_outcome", RiskAction.PAUSE_NEW_ENTRY,
+                    "one or both order outcomes are unknown; reconcile required",
+                    pair_id=plan.pair_id, persistent=True)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            unresolved = True
             log.exception("execute failed")
+            self._risk_event(
+                "execution_exception_unknown", RiskAction.PAUSE_NEW_ENTRY,
+                "execution raised after dispatch; order outcome may be unknown "
+                f"({type(exc).__name__})",
+                pair_id=plan.pair_id, persistent=True)
         finally:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()
@@ -1115,6 +1435,14 @@ class Engine:
         (buy, sell, plan), or None."""
         cfg = self.cfg
         self._update_spread_state(now)
+        market_reasons = ("disconnected", "not_ready", "empty_book",
+                          "connection_stale", "book_stale", "exchange_stale",
+                          "crossed_book")
+        for venue in self.venues.values():
+            if self._book_quality(venue, now).ok:
+                for reason in market_reasons:
+                    self._clear_transient_risk(
+                        f"market_data_{venue.key}_{reason}")
         pause_reason = self.strategy_pause_reason()
         if (pause_reason in ("dynamic_warmup", "regime_warmup")
                 and not self.pair_position.is_open):
@@ -1135,10 +1463,19 @@ class Engine:
                 action, required_edge, max_base = signal_context
             else:
                 required_edge = None
-                max_base = (self.pair_position.base_qty
+                max_base = (self._closeable_pair_base()
                             if action is SignalAction.EXIT else None)
+                if action is SignalAction.EXIT and max_base < self._min_base:
+                    self._armed[dkey] = None
+                    continue
             if pause_reason is not None and action is not SignalAction.EXIT:
                 self._armed[dkey] = None
+                continue
+            if (action is not SignalAction.EXIT
+                    and now - self.last_trade_ts < cfg.cooldown_sec):
+                self._armed[dkey] = None
+                self._schedule_poke(
+                    cfg.cooldown_sec - (now - self.last_trade_ts))
                 continue
             bq, sq = self._book_quality(buy, now), self._book_quality(sell, now)
             if not (bq.ok and sq.ok):
@@ -1152,8 +1489,7 @@ class Engine:
                     trigger, RiskAction.PAUSE_NEW_ENTRY,
                     f"{blocked.name} market data {quality.reason}")
                 continue
-            for reason in ("disconnected", "not_ready", "empty_book",
-                           "connection_stale", "book_stale"):
+            for reason in market_reasons:
                 self._clear_transient_risk(f"market_data_{buy.key}_{reason}")
                 self._clear_transient_risk(f"market_data_{sell.key}_{reason}")
             if not (buy.ready_to_trade() and sell.ready_to_trade()):
@@ -1162,9 +1498,13 @@ class Engine:
                 continue  # a venue in outage pauses the (only) pair
             if self._vlock(buy.key).locked() or self._vlock(sell.key).locked():
                 continue  # mid-execution or mid-reconcile
-            if self._venue_limited(buy) or self._venue_limited(sell):
+            if (action is not SignalAction.EXIT
+                    and (self._venue_limited(buy)
+                         or self._venue_limited(sell))):
                 continue  # reactive 429 exclusion
-            if not (self._venue_rate_ok(buy) and self._venue_rate_ok(sell)):
+            if (action is not SignalAction.EXIT
+                    and not (self._venue_rate_ok(buy)
+                             and self._venue_rate_ok(sell))):
                 self._skiplog("%s deferred: venue order budget exhausted", dkey)
                 continue
             # never refire into books that predate the venue's own last trade
@@ -1183,27 +1523,37 @@ class Engine:
                 self._armed[dkey] = None
                 continue
             armed = self._armed.get(dkey)
-            if armed is None:
+            if action is SignalAction.EXIT:
+                self._armed[dkey] = None
+            elif armed is None:
                 # premium persistence: only fire if the edge survives
                 # premium_persist_sec (filters one-tick phantoms)
                 self._armed[dkey] = now
                 self._schedule_poke(cfg.premium_persist_sec)
                 continue
-            if now - armed < cfg.premium_persist_sec:
+            elif now - armed < cfg.premium_persist_sec:
                 self._schedule_poke(cfg.premium_persist_sec - (now - armed))
                 continue
             if plan is None:
                 continue
-            headroom = self._headroom(buy, sell, plan.buy_limit)
-            if headroom < plan.buy_notional:
-                plan, _ = self._plan(
-                    buy, sell, min(plan_cap, headroom),
-                    required_edge_bps=required_edge, max_base=max_base,
-                    signal_action=action)
-                if plan is None:
-                    self._skiplog("%s blocked by position caps (headroom $%.0f)",
-                                  dkey, max(headroom, 0.0))
+            if action is not SignalAction.EXIT:
+                headroom = self._headroom(
+                    buy, sell, plan.buy_vwap or plan.buy_limit,
+                    plan.sell_vwap or plan.sell_limit)
+                if headroom <= 0:
+                    self._skiplog("%s blocked by position caps (no headroom)",
+                                  dkey)
                     continue
+                if headroom < max(plan.buy_notional, plan.sell_notional):
+                    plan, _ = self._plan(
+                        buy, sell, min(plan_cap, headroom),
+                        required_edge_bps=required_edge, max_base=max_base,
+                        signal_action=action)
+                    if plan is None:
+                        self._skiplog(
+                            "%s blocked by position caps (headroom $%.0f)",
+                            dkey, max(headroom, 0.0))
+                        continue
             if best is None or plan.exp_edge_usd > best[2].exp_edge_usd:
                 best = (buy, sell, plan)
         return best
@@ -1217,13 +1567,16 @@ class Engine:
                  event.from_state.value if event.from_state else "—",
                  event.to_state.value, reason)
         if self.ledger is not None:
-            self.ledger.append_event("EXECUTION_STATE", {
-                "pair_id": execution.pair_id,
-                "from_state": (event.from_state.value
-                               if event.from_state else None),
-                "to_state": event.to_state.value,
-                "reason": reason, "data": data,
-            })
+            try:
+                self.ledger.append_event("EXECUTION_STATE", {
+                    "pair_id": execution.pair_id,
+                    "from_state": (event.from_state.value
+                                   if event.from_state else None),
+                    "to_state": event.to_state.value,
+                    "reason": reason, "data": data,
+                })
+            except Exception as exc:
+                self._mark_persistence_failure(exc)
         self._persist_runtime()
 
     def _new_pair_execution(self, plan: ArbPlan, direction: str) -> PairExecution:
@@ -1267,29 +1620,109 @@ class Engine:
         limit = venue.px_round(ref * (1 + slip), True) if is_buy else \
             venue.px_round(ref * (1 - slip), False)
         qty = floor_step(qty, self._step)
-        if qty < venue.min_base or qty * limit < max(
-                self.cfg.min_order_notional, venue.min_quote):
+        minimum_quote = max(
+            venue.min_quote,
+            self.cfg.min_order_notional / self._quote_rate(venue))
+        if qty < venue.min_base or qty * limit < minimum_quote:
             return None
         log.error("[RECOVERY] pair=%s undo known %s leg %.6g on %s",
                   plan.pair_id, "BUY" if original_is_buy else "SELL",
                   qty, venue.name)
         self._record_send(venue)
-        result = await venue.send_taker(
-            is_buy=is_buy, qty=qty, limit_px=limit, reduce_only=True)
+        try:
+            result = await self._send_bounded(
+                venue,
+                is_buy=is_buy, qty=qty, limit_px=limit, reduce_only=True)
+        except Exception as exc:
+            result = exc
         return {"venue": venue, "original_is_buy": original_is_buy,
-                "limit_px": limit, "result": result}
+                "limit_px": limit, "requested_qty": qty, "result": result}
 
     async def _execute(self, buy, sell, plan: ArbPlan, *,
                        signal_ts: Optional[float] = None) -> bool:
         """Send both legs and settle the fills. Both venue locks are held by
         the caller. Returns True when an outcome is unresolved and the caller
         must escalate to reconcile."""
-        if self.halted:
+        if self.record_only:
+            log.critical("record-only execution attempt blocked before dispatch")
+            return False
+        try:
+            action = SignalAction(plan.signal_action)
+        except ValueError:
+            self._risk_event(
+                "invalid_order_plan", RiskAction.PAUSE_NEW_ENTRY,
+                "order plan has an invalid signal action", persistent=True)
+            return False
+        numeric_plan = (plan.qty, plan.buy_limit, plan.sell_limit,
+                        plan.buy_notional, plan.sell_notional)
+        if (not all(math.isfinite(float(value)) for value in numeric_plan)
+                or plan.qty <= 0 or plan.buy_limit <= 0
+                or plan.sell_limit <= 0):
+            self._risk_event(
+                "invalid_order_plan", RiskAction.PAUSE_NEW_ENTRY,
+                "order plan contains non-finite or non-positive values",
+                pair_id=plan.pair_id, persistent=True)
+            return False
+        if self.halted and action is not SignalAction.EXIT:
+            return False
+        if not (self._book_quality(buy).ok and self._book_quality(sell).ok
+                and buy.ready_to_trade() and sell.ready_to_trade()):
+            return False
+        if action is not SignalAction.EXIT and self.strategy_pause_reason():
+            return False
+        if (action is SignalAction.EXIT
+                and plan.qty > self._closeable_pair_base() + self._step / 2):
+            self._risk_event(
+                "exit_quantity_changed", RiskAction.PAUSE_NEW_ENTRY,
+                "closeable venue quantity fell below the planned EXIT",
+                pair_id=plan.pair_id, persistent=True)
             return False
         cfg = self.cfg
-        inv_bps = self._inv_add_bps(buy, sell)
         direction = "sell_entropy" if sell.key == "entropy" else "buy_entropy"
+        if action is not SignalAction.EXIT:
+            # Positions/cost inputs may change after signal generation. Recheck
+            # both the action and the current-book executable slice while the
+            # two venue locks are held, before either order is dispatched.
+            if self._signal_action(direction) is not action:
+                return False
+            headroom = self._headroom(
+                buy, sell, plan.buy_vwap or plan.buy_limit,
+                plan.sell_vwap or plan.sell_limit)
+            if headroom <= 0:
+                return False
+            plan_cap = (cfg.vwap_sizing.max_order_usd
+                        if cfg.vwap_sizing.enabled
+                        else cfg.max_order_notional)
+            refreshed_required = None
+            refreshed_max_base = plan.qty
+            if cfg.midline.mode == "dynamic":
+                context = self._dynamic_signal_context(
+                    buy, sell, direction)
+                if context is None or context[0] is not action:
+                    return False
+                _, refreshed_required, context_max_base = context
+                if context_max_base is not None:
+                    refreshed_max_base = min(
+                        refreshed_max_base, context_max_base)
+            refreshed, _ = self._plan(
+                buy, sell, min(plan_cap, headroom),
+                required_edge_bps=refreshed_required,
+                max_base=refreshed_max_base, signal_action=action)
+            if refreshed is None or refreshed.qty + self._step / 2 < plan.qty:
+                return False
+        inv_bps = self._inv_add_bps(buy, sell)
         execution = self._new_pair_execution(plan, direction)
+        # Ledger fsync is intentionally before order dispatch. If it stalls,
+        # wall-clock freshness and cost/risk state may have expired even
+        # though no coroutine could update the in-memory book meanwhile.
+        if (not self._book_quality(buy).ok
+                or not self._book_quality(sell).ok
+                or (action is not SignalAction.EXIT
+                    and self.strategy_pause_reason())):
+            self._transition_execution(
+                execution, ExecutionState.FAILED,
+                "final pre-dispatch freshness/risk gate failed")
+            return False
         self.last_trade_ts = time.time()
         log.info("[ARB] %s %s pair=%s: BUY %s %.6g @<=%.6g | "
                  "SELL %s @>=%.6g | "
@@ -1313,17 +1746,22 @@ class Engine:
         self._transition_execution(
             execution, ExecutionState.ORDERS_SENT,
             "both taker legs dispatched", qty=plan.qty)
+        reduce_only = action is SignalAction.EXIT
         tasks = [
             asyncio.create_task(buy.send_taker(
-                is_buy=True, qty=plan.qty, limit_px=buy_bound)),
+                is_buy=True, qty=plan.qty, limit_px=buy_bound,
+                reduce_only=reduce_only)),
             asyncio.create_task(sell.send_taker(
-                is_buy=False, qty=plan.qty, limit_px=sell_bound)),
+                is_buy=False, qty=plan.qty, limit_px=sell_bound,
+                reduce_only=reduce_only)),
         ]
         recovery = None
         timed_out = False
         if cfg.execution_risk.enabled:
             done, pending = await asyncio.wait(
-                tasks, timeout=cfg.execution_risk.hedge_timeout_ms / 1000.0)
+                tasks, timeout=min(
+                    cfg.execution_risk.hedge_timeout_ms / 1000.0,
+                    cfg.settle_timeout_sec))
             timed_out = bool(pending)
             if timed_out:
                 self._transition_execution(
@@ -1336,22 +1774,65 @@ class Engine:
                     finished = next(iter(done))
                     index = tasks.index(finished)
                     try:
-                        known = finished.result()
-                    except Exception:
-                        known = None
-                    if isinstance(known, dict) and known.get("filled_base", 0) > 0:
+                        raw_known = finished.result()
+                    except Exception as exc:
+                        raw_known = exc
+                    known_venue = buy if index == 0 else sell
+                    known = self._normalize_order_result(
+                        raw_known, plan.qty, venue_key=known_venue.key,
+                        pair_id=plan.pair_id)
+                    if (not known.get("unresolved")
+                            and known.get("filled_base", 0) > 0):
                         recovery = await self._recover_known_leg(
-                            buy if index == 0 else sell,
+                            known_venue,
                             original_is_buy=index == 0,
                             qty=known["filled_base"], plan=plan)
-        res = await asyncio.gather(*tasks, return_exceptions=True)
+        # Adapter implementations are expected to bound their own settlement
+        # waits, but the engine must not trust that contract with real money.
+        # A coroutine that never returns after dispatch is an UNKNOWN order,
+        # never evidence of a rejection or zero fill. Bound the pair-level
+        # wait, cancel only the local waiter, persist the ambiguity below, and
+        # let reconciliation establish the exchange-side result.
+        remaining = max(
+            cfg.settle_timeout_sec - (time.time() - dispatch_ts), 0.0)
+        done, pending = await asyncio.wait(tasks, timeout=remaining)
+        if pending:
+            timed_out = True
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(self._consume_background_order)
+        res = []
+        for task in tasks:
+            if task in pending:
+                res.append({
+                    "status": "engine-timeout",
+                    "filled_base": 0.0,
+                    "avg_px": None,
+                    "err": "order response unresolved at engine timeout",
+                    "unresolved": True,
+                    "accounting_complete": False,
+                })
+                continue
+            try:
+                res.append(task.result())
+            except asyncio.CancelledError:
+                res.append({
+                    "status": "engine-cancelled",
+                    "filled_base": 0.0,
+                    "avg_px": None,
+                    "err": "order response cancelled before resolution",
+                    "unresolved": True,
+                    "accounting_complete": False,
+                })
+            except Exception as exc:
+                res.append(exc)
         settled_ts = time.time()
         self.latency.record(
             "orders_to_settle_ms", (settled_ts - dispatch_ts) * 1000.0)
-        binfo, sinfo = (r if isinstance(r, dict) else
-                        {"status": "send-failed", "filled_base": 0.0,
-                         "avg_px": None, "err": repr(r), "unresolved": False}
-                        for r in res)
+        binfo = self._normalize_order_result(
+            res[0], plan.qty, venue_key=buy.key, pair_id=plan.pair_id)
+        sinfo = self._normalize_order_result(
+            res[1], plan.qty, venue_key=sell.key, pair_id=plan.pair_id)
         for info in (binfo, sinfo):
             send_ts, ack_ts = info.get("order_send_ts"), info.get("order_ack_ts")
             first_fill_ts = info.get("first_fill_ts")
@@ -1370,37 +1851,74 @@ class Engine:
                 log.error("[%s] %s leg: %s", v.name, side, info["err"])
         bfill = binfo["filled_base"]
         sfill = sinfo["filled_base"]
-        bpx = binfo.get("avg_px") or plan.buy_limit
-        spx = sinfo.get("avg_px") or plan.sell_limit
+        missing_fill_price = (
+            (bfill > 0 and (not binfo.get("avg_px")
+                            or not binfo.get("accounting_complete", True)))
+            or (sfill > 0 and (not sinfo.get("avg_px")
+                               or not sinfo.get("accounting_complete", True))))
+        if missing_fill_price:
+            self._risk_event(
+                "incomplete_fill_accounting", RiskAction.PAUSE_NEW_ENTRY,
+                "filled quantity is known but actual average price is missing",
+                pair_id=plan.pair_id, persistent=True)
+        bpx = binfo.get("avg_px")
+        spx = sinfo.get("avg_px")
         buy.position += bfill
         sell.position -= sfill
         if bfill:
-            buy.cash -= bfill * bpx * (1 + plan.buy_fee)
-            buy.volume_usd += bfill * bpx
+            if bpx is None:
+                buy.accounting_complete = False
+            else:
+                buy.cash -= bfill * bpx * (1 + plan.buy_fee)
+                buy.volume_usd += self._notional_usd(buy, bfill, bpx)
         if sfill:
-            sell.cash += sfill * spx * (1 - plan.sell_fee)
-            sell.volume_usd += sfill * spx
+            if spx is None:
+                sell.accounting_complete = False
+            else:
+                sell.cash += sfill * spx * (1 - plan.sell_fee)
+                sell.volume_usd += self._notional_usd(sell, sfill, spx)
 
         recovered_buy = recovered_sell = 0.0
         recovery_accounting = None
+        recovery_unresolved = False
+        recovery_hard_err = False
         if recovery is not None:
-            venue, info = recovery["venue"], recovery["result"]
-            recovered = (info.get("filled_base", 0.0)
-                         if isinstance(info, dict) else 0.0)
+            venue = recovery["venue"]
+            info = self._normalize_order_result(
+                recovery["result"], recovery["requested_qty"],
+                venue_key=venue.key, pair_id=plan.pair_id)
+            recovery_unresolved = bool(info.get("unresolved"))
+            recovery_hard_err = info.get("err") is not None
+            recovered = (0.0 if recovery_unresolved
+                         else info.get("filled_base", 0.0))
             if recovered:
-                px = info.get("avg_px") or recovery["limit_px"]
-                fee = venue.fee_bps / 1e4
+                px = info.get("avg_px")
                 if recovery["original_is_buy"]:
                     recovered_buy = recovered
                     venue.position -= recovered
-                    venue.cash += recovered * px * (1 - fee)
-                    recovery_accounting = (venue, True, bpx, px, recovered)
+                    original_px = bpx
                 else:
                     recovered_sell = recovered
                     venue.position += recovered
-                    venue.cash -= recovered * px * (1 + fee)
-                    recovery_accounting = (venue, False, spx, px, recovered)
-                venue.volume_usd += recovered * px
+                    original_px = spx
+                if px is None or original_px is None:
+                    venue.accounting_complete = False
+                    self._risk_event(
+                        "incomplete_fill_accounting",
+                        RiskAction.PAUSE_NEW_ENTRY,
+                        "recovery fill has no actual average price",
+                        pair_id=plan.pair_id, persistent=True)
+                else:
+                    fee = venue.fee_bps / 1e4
+                    if recovery["original_is_buy"]:
+                        venue.cash += recovered * px * (1 - fee)
+                    else:
+                        venue.cash -= recovered * px * (1 + fee)
+                    recovery_accounting = (
+                        venue, recovery["original_is_buy"], original_px,
+                        px, recovered)
+                    venue.volume_usd += self._notional_usd(
+                        venue, recovered, px)
 
         effective_buy = max(bfill - recovered_buy, 0.0)
         effective_sell = max(sfill - recovered_sell, 0.0)
@@ -1415,7 +1933,8 @@ class Engine:
                             else pair_direction)
         if matched > 0:
             self._record_pair_fill(
-                ledger_direction, action, buy, sell, plan, matched, bpx, spx)
+                ledger_direction, action, buy, sell, plan, matched, bpx, spx,
+                accounting_complete=not missing_fill_price)
             if action is SignalAction.EXIT:
                 self.pair_position.reduce(matched)
             else:
@@ -1445,8 +1964,11 @@ class Engine:
             self._persist_runtime()
         fill_edge = 0.0
         if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
-            fill_edge = matched * (sinfo["avg_px"] * (1 - plan.sell_fee)
-                                   - binfo["avg_px"] * (1 + plan.buy_fee))
+            fill_edge = matched * (
+                sinfo["avg_px"] * self._quote_rate(sell)
+                * (1 - plan.sell_fee)
+                - binfo["avg_px"] * self._quote_rate(buy)
+                * (1 + plan.buy_fee))
             self.total_fill_edge += fill_edge
         log.info("[SETTLED] %s: buy %s %s %.6g/%.6g | sell %s %s %.6g/%.6g | "
                  "matched %.6g | fill edge $%.4f", direction,
@@ -1454,11 +1976,13 @@ class Engine:
                  sell.name, sinfo["status"], sfill, plan.qty, matched, fill_edge)
         buy.last_traded_ts = sell.last_traded_ts = time.time()
 
-        unresolved = binfo.get("unresolved") or sinfo.get("unresolved")
+        unresolved = (binfo.get("unresolved") or sinfo.get("unresolved")
+                      or recovery_unresolved)
         hard_err = (binfo.get("err") is not None
-                    or sinfo.get("err") is not None)
+                    or sinfo.get("err") is not None or recovery_hard_err)
         imbalance = abs(effective_buy - effective_sell)
-        partial = imbalance > self._step / 2
+        partial = (bfill < plan.qty - self._step / 2
+                   or sfill < plan.qty - self._step / 2)
         self.consecutive_partial_fills = (
             self.consecutive_partial_fills + 1 if partial else 0)
         if (self.cfg.kill_switch.enabled
@@ -1481,10 +2005,11 @@ class Engine:
                 self._transition_execution(
                     execution, ExecutionState.FAILED,
                     "both-leg execution failed without fills")
-            elif imbalance > self._step / 2 or not (effective_buy and effective_sell):
+            elif (partial or imbalance > self._step / 2
+                  or not (effective_buy and effective_sell)):
                 self._transition_execution(
                     execution, ExecutionState.PARTIAL,
-                    "unequal or one-leg fill", buy_fill=effective_buy,
+                    "partial, unequal, or one-leg fill", buy_fill=effective_buy,
                     sell_fill=effective_sell)
                 self._transition_execution(
                     execution, ExecutionState.RECOVERY,
@@ -1541,12 +2066,14 @@ class Engine:
 
     def _record_recovery_roundtrip(
             self, pair_id: str, pair_direction: PairDirection, venue,
-            original_is_buy: bool, original_px: float, recovery_px: float,
+            original_is_buy: bool, original_px: Optional[float],
+            recovery_px: Optional[float],
             qty: float, complete_if_flat: bool = False, *,
             signal_spread_bps: Optional[float] = None,
             signal_z_score: Optional[float] = None,
             signal_midline_bps: Optional[float] = None) -> None:
-        if self.ledger is None or not pair_id or qty <= 0:
+        if (self.ledger is None or not pair_id or qty <= 0
+                or original_px is None or recovery_px is None):
             return
         pair = self.ledger.ensure_pair(
             pair_id=pair_id, symbol=self.cfg.symbol,
@@ -1573,20 +2100,39 @@ class Engine:
 
     def _record_pair_fill(self, pair_direction: PairDirection,
                           action: SignalAction, buy, sell, plan: ArbPlan,
-                          matched: float, buy_px: float, sell_px: float) -> None:
+                          matched: float, buy_px: Optional[float],
+                          sell_px: Optional[float], *,
+                          accounting_complete: bool = True) -> None:
         if self.ledger is None or not plan.pair_id:
             return
         pair = self.ledger.ensure_pair(
             pair_id=plan.pair_id, symbol=self.cfg.symbol,
             venue_a=self.entropy.name, venue_b=self.hedge.name,
             direction=pair_direction.value)
+        if not accounting_complete:
+            pair.accounting_complete = False
         try:
             buy_quote_usd = self.costs.quote_rate(buy.key)
             sell_quote_usd = self.costs.quote_rate(sell.key)
         except KeyError:
             buy_quote_usd = sell_quote_usd = 1.0
-        fill = {
+        common = {
             "action": action.value, "qty": matched,
+            "spread_bps": plan.signal_spread_bps,
+            "z_score": plan.signal_z_score,
+            "midline_bps": plan.signal_midline_bps,
+            "market_session": self.market_session.session.value,
+            "at": time.time(),
+        }
+        if not accounting_complete or buy_px is None or sell_px is None:
+            self.ledger.record_unpriced_fill(pair, common)
+            self.ledger.append_event("PAIR_ACCOUNTING_INCOMPLETE", {
+                "pair_id": pair.pair_id,
+                "reason": "actual fill average price unavailable"})
+            self._persist_runtime()
+            return
+        fill = {
+            **common,
             "buy_key": buy.key, "sell_key": sell.key,
             "buy_px": buy_px, "sell_px": sell_px,
             "planned_buy_px": plan.buy_vwap or plan.buy_limit,
@@ -1594,13 +2140,8 @@ class Engine:
             "buy_fee_rate": plan.buy_fee, "sell_fee_rate": plan.sell_fee,
             "buy_quote_usd": buy_quote_usd,
             "sell_quote_usd": sell_quote_usd,
-            "spread_bps": plan.signal_spread_bps,
-            "z_score": plan.signal_z_score,
-            "midline_bps": plan.signal_midline_bps,
             "funding_cost_bps": plan.funding_cost_bps,
             "stablecoin_basis_bps": plan.stablecoin_basis_bps,
-            "market_session": self.market_session.session.value,
-            "at": time.time(),
         }
         self.ledger.record_fill(pair, fill)
         self._persist_runtime()
@@ -1669,6 +2210,11 @@ class Engine:
                 recovered.entry_spread = self.premium_bps()
                 recovered.accounting_complete = False
                 self.ledger.append_event("PAIR_RECOVERED", recovered.to_dict())
+                self._risk_event(
+                    "ledger_position_recovered",
+                    RiskAction.PAUSE_NEW_ENTRY,
+                    "venue positions exist without a complete local Pair ledger",
+                    pair_id=recovered.pair_id, persistent=True)
             elif self.ledger.current is not None:
                 current = self.ledger.current
                 if not self.pair_position.is_open:
@@ -1731,7 +2277,9 @@ class Engine:
                 continue
             limit = v.px_round(ref * (1 - slip), False) if is_sell \
                 else v.px_round(ref * (1 + slip), True)
-            if qty * limit < max(cfg.min_order_notional, v.min_quote):
+            minimum_quote = max(
+                v.min_quote, cfg.min_order_notional / self._quote_rate(v))
+            if qty * limit < minimum_quote:
                 continue
             await lk.acquire()  # verified free, no awaits since: fast path
             try:
@@ -1739,26 +2287,48 @@ class Engine:
                             net, "SELL" if is_sell else "BUY", qty, v.name, limit)
                 self.hedges += 1
                 self._record_send(v)  # counts toward the budget, never blocked
-                info = await v.send_taker(is_buy=not is_sell, qty=qty,
-                                          limit_px=limit, reduce_only=True)
+                try:
+                    raw = await self._send_bounded(
+                        v,
+                        is_buy=not is_sell, qty=qty,
+                        limit_px=limit, reduce_only=True)
+                except Exception as exc:
+                    raw = exc
+                info = self._normalize_order_result(
+                    raw, qty, venue_key=v.key, pair_id=pair_id)
                 if info.get("err") or info.get("unresolved"):
                     log.error("[HEDGE] %s: %s", v.name,
                               info.get("err") or "unresolved")
                     if str(info.get("err", "")).startswith("RATE_LIMITED"):
                         self._mark_limited(v)
+                    if info.get("unresolved"):
+                        self._risk_event(
+                            "unknown_risk_order_outcome",
+                            RiskAction.PAUSE_NEW_ENTRY,
+                            "reduce-only hedge outcome is unknown",
+                            pair_id=pair_id, persistent=True)
                     self._reconcile_evt.set()
                 else:
                     fill = info["filled_base"]
                     v.position += -fill if is_sell else fill
                     if fill:
-                        px = info.get("avg_px") or limit
-                        fee = v.fee_bps / 1e4
-                        v.cash += fill * px * (1 - fee) if is_sell \
-                            else -fill * px * (1 + fee)
-                        v.volume_usd += fill * px
+                        px = info.get("avg_px")
+                        if px is None:
+                            v.accounting_complete = False
+                            self._risk_event(
+                                "incomplete_fill_accounting",
+                                RiskAction.PAUSE_NEW_ENTRY,
+                                "hedge fill has no actual average price",
+                                pair_id=pair_id, persistent=True)
+                        else:
+                            fee = v.fee_bps / 1e4
+                            v.cash += fill * px * (1 - fee) if is_sell \
+                                else -fill * px * (1 + fee)
+                            v.volume_usd += self._notional_usd(v, fill, px)
                         context = (self._unmatched_legs.get(pair_id)
                                    if pair_id else None)
-                        if (context and context.get("venue_key") == v.key
+                        if (px is not None and context
+                                and context.get("venue_key") == v.key
                                 and bool(context.get("original_is_buy"))
                                 == is_sell):
                             recovered = min(
@@ -1767,7 +2337,7 @@ class Engine:
                                 pair_id,
                                 PairDirection(context["pair_direction"]), v,
                                 bool(context["original_is_buy"]),
-                                float(context["original_px"]), px, recovered,
+                                context.get("original_px"), px, recovered,
                                 complete_if_flat=not self.pair_position.is_open,
                                 signal_spread_bps=context.get(
                                     "signal_spread_bps"),
@@ -1850,6 +2420,20 @@ class Engine:
                     log.warning("[%s] position fetch failed (%d): %r",
                                 v.name, n, e)
                 return
+            try:
+                r = float(r)
+            except (TypeError, ValueError):
+                r = float("nan")
+            if not math.isfinite(r):
+                if strict:
+                    raise RuntimeError(
+                        f"[{v.name}] starting position is not finite")
+                self._risk_event(
+                    f"invalid_position_{v.key}",
+                    RiskAction.PAUSE_NEW_ENTRY,
+                    f"{v.name} returned a non-finite position",
+                    persistent=True)
+                return
             if v.key in self._venue_down:
                 log.warning("[%s] API recovered after %.0fs outage — "
                              "trading RESUMED", v.name,
@@ -1863,7 +2447,8 @@ class Engine:
                     log.warning("[%s] reconcile: chain %+.6g vs local %+.6g "
                                 "— adopting chain", v.name, r, v.position)
                 mid = v.book.mid()
-                mismatch_usd = abs(delta) * mid if mid is not None else None
+                mismatch_usd = (self._notional_usd(v, delta, mid)
+                                if mid is not None else None)
                 if (self.cfg.kill_switch.enabled and mismatch_usd is not None
                         and mismatch_usd
                         > self.cfg.kill_switch.max_reconcile_mismatch_usd):
@@ -1874,8 +2459,9 @@ class Engine:
                         observed_value=mismatch_usd,
                         threshold=self.cfg.kill_switch.max_reconcile_mismatch_usd,
                         persistent=True)
-                if mid is not None:
-                    v.cash -= delta * mid
+                # A position query proves quantity, not historical execution
+                # price. Never synthesize cash/PnL from the current mid.
+                v.accounting_complete = False
                 v.position = r
 
     async def _reconcile_loop(self) -> None:
@@ -1930,19 +2516,31 @@ class Engine:
     def account_delta(self) -> Optional[float]:
         """Change in real account equity since start (both venues)."""
         total = 0.0
+        now = time.time()
         for v in self.venues.values():
             if v.equity is None or v.start_equity is None:
                 return None
-            total += v.equity - v.start_equity
+            try:
+                quote_rate = self.costs.fresh_quote_rate(v.key, now)
+            except KeyError:
+                return None
+            total += (v.equity - v.start_equity) * quote_rate
         return total
 
     def session_pnl(self) -> Optional[float]:
         total = 0.0
+        now = time.time()
         for v in self.venues.values():
+            if not getattr(v, "accounting_complete", True):
+                return None
             m = v.book.mid()
             if m is None:
                 return None
-            total += v.cash + v.position * m
+            try:
+                quote_rate = self.costs.fresh_quote_rate(v.key, now)
+            except KeyError:
+                return None
+            total += (v.cash + v.position * m) * quote_rate
         if self._mtm_baseline is None:
             self._mtm_baseline = total
         return total - self._mtm_baseline

@@ -1,6 +1,8 @@
 """Dynamic baseline, robust volatility, Z-score, and regime tests."""
 import math
 
+import pytest
+
 from entropy_arb.midline import (DynamicMidline, RegimeDetector, SpreadStats)
 
 
@@ -108,3 +110,23 @@ def test_regime_recovery_requires_continuous_healthy_period():
     assert detector.update(abnormal, now=2.0).paused
     assert detector.update(healthy, now=3.0).paused
     assert detector.update(healthy, now=6.0).paused is False
+
+
+def test_estimators_reject_nonfinite_constructor_limits():
+    with pytest.raises(ValueError, match="finite"):
+        estimator(fast_window_seconds=math.nan)
+    with pytest.raises(ValueError, match="finite"):
+        RegimeDetector(
+            max_fast_slow_difference_bps=math.nan, max_z_score=5.0,
+            max_absolute_spread_bps=50.0, break_persist_seconds=0.0,
+            recovery_persist_seconds=3.0)
+
+
+def test_regime_rejects_nonfinite_status_instead_of_failing_open():
+    detector = RegimeDetector(
+        max_fast_slow_difference_bps=8.0, max_z_score=5.0,
+        max_absolute_spread_bps=50.0, break_persist_seconds=0.0,
+        recovery_persist_seconds=3.0)
+    bad = stats(spread=math.nan)
+    with pytest.raises(ValueError, match="finite"):
+        detector.update(bad, now=1.0)

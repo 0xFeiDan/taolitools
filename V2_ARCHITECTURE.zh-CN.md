@@ -252,6 +252,16 @@ Dynamic 模式的生命周期：
 Dynamic 模式中，`upper_bps` 和 `lower_bps` 不再驱动 OPEN/ADD/EXIT，只保留给
 Static 模式兼容。
 
+Static 的 upper/lower 是价格比率空间的信号距离，不是固定美元利润保证。即使两次
+成交分别跨过两侧阈值，共同价格水平、两边真实成交量、Funding 与 quote/USD 汇率
+也可能在持仓期间变化。`midline=5, upper=4, lower=3` 时，按
+`100.091/100` 开仓、再按 `1000/999.801` 退出即可得到未计费约 `-$0.108/base`
+的反例。因此分析工具不得把 `upper+lower` 描述为无条件往返收益下限。
+
+反向 BUY-Entropy 门槛由原始 `midline-lower` 边界取精确倒数得到，不使用
+`lower-midline` 的线性近似。Dynamic 的 Z-score 边界也先在 Entropy/Hedge 原始
+比率空间计算，再按执行方向取倒数并换算 quote/USD。
+
 ### 7.5 预热
 
 在有效样本数小于 `min_samples` 时：
@@ -377,7 +387,8 @@ book_age_ms
 系统区分两类问题：
 
 1. `execution.staleness_sec`：WebSocket 或连接多久没有收到消息；
-2. `market_data.max_book_age_ms`：订单簿本身多久没有真实更新。
+2. `market_data.max_book_age_ms`：订单簿本身多久没有真实更新，以及有服务器时间戳时
+   交易所快照距本地接收时间是否过旧。
 
 配置：
 
@@ -393,7 +404,8 @@ market_data:
 - not ready；
 - empty book；
 - connection stale；
-- book stale。
+- book stale；
+- exchange stale、明显未来的交易所时间戳。
 
 行情恢复后，瞬时行情风险事件可以自动清除；持久 Kill Switch 事件不会因为重启自动
 清除。
@@ -680,15 +692,30 @@ reduce-only 反向单撤销已知单腿。
 
 ### 18.2 未知结果
 
-如果订单结果 unresolved，不会假设未成交。系统保留执行任务，触发对账，等待真实
-结果后再恢复净 Delta。
+如果订单结果 unresolved，不会假设未成交。系统会在释放两边执行锁前写入持久化
+`PAUSE_NEW_ENTRY`，因此对账完成前不能 OPEN/ADD；只保留对账、EXIT 和 reduce-only
+风险恢复。随后触发持仓对账，等待真实结果后恢复净 Delta。单纯重启不会清除暂停。
 
 ### 18.3 EXIT
 
 EXIT 的另一腿结果未知时，不盲目把已完成的退出腿重新开回去，而是等待结算和持仓
-对账，再恢复 Delta Neutral。
+对账，再恢复 Delta Neutral。所有 EXIT 双腿都强制 `reduce_only=true`，即使本地
+Pair 数量过期也不能反向开仓。
 
-### 18.4 恢复记账
+### 18.4 启动持仓保护
+
+实盘启动时先完成双方严格持仓查询，再创建策略任务。若两边基础资产数量不平衡且
+超过 `net_tolerance_base`，立即持久暂停 OPEN/ADD 并唤醒对账/对冲流程。行情尚未
+就绪时也不会先放行策略。
+
+### 18.5 Hyperliquid 实际成交均价
+
+`/exchange` 超时或 5xx 后，先用 cloid 查询 `orderStatus`，再按返回的 exchange
+order ID 查询成交历史并按数量计算实际 VWAP。若成交数量已确认但成交历史仍拿不到
+均价，系统不会使用计划限价伪造现金流或 PnL；只持久化已知数量，把 Pair 标记为
+`accounting_complete=false` 并持久暂停新增仓位，等待人工审计或后续真实成交证据。
+
+### 18.6 恢复记账
 
 撤销单腿、补 hedge 和恢复滑点都记录到原 `pair_id` 的 `recovery_pnl`、手续费和
 净 PnL 中，不会创建一笔看起来独立盈利、实际掩盖恢复损失的新 Pair。
@@ -715,10 +742,13 @@ EXIT 的另一腿结果未知时，不盲目把已完成的退出腿重新开回
 | Stablecoin 数据缺失/过期/严重脱锚 | 暂停新增 |
 | Regime break | 暂停新增 |
 | 股票交易时段切换 | 切换到独立统计池；Session 本身不暂停新增 |
-| 净 Delta 超过阈值 | 立即尝试 Emergency Hedge |
+| 净 Delta 超过阈值 | 立即暂停 OPEN/ADD 并尝试 Emergency Hedge；无法估值时计时不重置 |
 | 净 Delta 持续超时 | 持久暂停新增；可选 Flatten |
 | 连续不等量/部分成交 | 持久暂停新增 |
 | 连续执行失败 | 持久暂停新增 |
+| 未知订单结果 | 释放执行锁前持久暂停新增并触发对账 |
+| 已知成交数量但缺少实际均价 | 账本标记不完整并持久暂停新增 |
+| 启动持仓不平衡 | 策略任务创建前持久暂停并安排风险恢复 |
 | 链上与本地持仓不一致 | 持久暂停新增并采用对账结果 |
 | Pair 账本与链上持仓不一致 | 追加对账事件并持久暂停 |
 | 会话 MTM 亏损超过上限 | 持久暂停；可选 Flatten |
@@ -754,10 +784,14 @@ kill_switch:
 - 净 Delta 长时间超限；
 - 连续部分成交；
 - 连续执行失败；
+- 未知订单结果；
+- 实际成交均价缺失；
+- 启动持仓不平衡；
 - 持仓对账严重不一致；
 - Pair 账本与链上不一致；
 - 会话亏损超限；
 - 待完成 Emergency Flatten。
+- 关闭时仍在途或重启恢复出的非终态执行。
 
 仅仅重启程序不会清除这些暂停。
 
@@ -831,6 +865,17 @@ net_pnl
 如果启动后从链上发现一个本地没有完整历史的 Pair，系统会保守恢复持仓，但将
 `accounting_complete` 标为 false，不会伪造进场成交。
 
+实盘启动强制要求 `accounting.enabled=true`。若状态目录留下
+`runtime-state.json.tmp`，说明上一次原子快照没有完成，程序拒绝实盘重启并要求
+人工检查。只要任一腿使用 USDC、USDG 等非 USD 计价资产，实盘也强制要求启用
+新鲜的 stablecoin quote/USD 换算；换算缺失、过期或脱锚时禁止 OPEN/ADD。
+账户变化和会话 PnL 只使用新鲜换算；过期时返回未知，不能用旧 USDG/USDC 汇率
+继续执行 `max_session_loss_usd` 的 USD 计算。
+
+所有 YAML 浮点数必须通过 `math.isfinite()`；`.nan`、`.inf` 和 `-.inf` 在启动时
+直接拒绝。手续费、仓位上限、订单上下限、滑点、延迟、次数和时间参数还会执行各自
+范围校验。纯函数 planner 也再次拒绝非有限输入，防止绕过配置层直接调用。
+
 ---
 
 ## 22. 账本与重启恢复
@@ -873,6 +918,14 @@ accounting:
 
 状态快照与 JSONL 是两个文件，无法组成数据库级跨文件原子事务。实现优先确保重启后
 不会因为审计日志晚一步写入而恢复更旧的风险敞口。
+
+程序关闭只会有界等待正在执行的双腿任务；若任务仍未结束，会先把结果记录为未知并
+持久暂停。重启读取到 `ORDERS_SENT`、`PARTIAL`、`BOTH_FILLED`、`RECOVERY`、
+`HEDGED` 或 `UNWINDING` 等非终态执行时，不会把它们当作已完成，而是要求先对账。
+
+`requirements-live.txt` 当前不是实盘供应链锁文件：Hyperliquid/签名依赖只有版本下限，
+Lighter SDK 直接跟随 GitHub `main`。在取得并本地审计一个确定版本前，不应安装它用于
+真实资金；部署时还必须固定 commit、包版本与制品哈希。
 
 ---
 
@@ -1092,7 +1145,7 @@ Copy-Item config.example.yaml config.yaml
 当前结果：
 
 ```text
-113 passed
+125 passed
 ```
 
 覆盖范围包括：
@@ -1108,11 +1161,18 @@ Copy-Item config.example.yaml config.yaml
 - stale book 和断连；
 - Funding 和 Stablecoin Basis；
 - 配置严格校验；
+- NaN/Infinity 与 planner 二次防御；
+- 非有限订单簿档位丢弃；
 - 股票 Session、夏令时、周末、节假日和提前收盘；
 - Session 统计隔离；
-- 非正常时段阻止 OPEN/ADD 但允许 EXIT；
+- 股票永续四时段都允许交易并使用独立统计；
 - 执行状态机；
 - 单腿超时撤销；
+- 未知订单结果持久暂停；
+- EXIT 两腿 reduce-only；
+- 启动不平衡持仓 fail-closed；
+- HL 成交历史实际 VWAP 与不完整账本暂停；
+- quote→USD 的 sizing、仓位和 MTM 统一换算；
 - 连续 partial fill；
 - Emergency Hedge 和 Emergency Flatten 重试；
 - Pair PnL、Funding、Basis 和恢复损益；

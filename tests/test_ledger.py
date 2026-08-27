@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from entropy_arb.ledger import PairLedger
 
 
@@ -72,6 +74,32 @@ def test_quote_basis_is_included_in_pair_net_pnl(tmp_path):
     assert pair.net_pnl < pair.gross_pnl
 
 
+def test_manual_usd_pnl_fee_funding_and_basis_sample(tmp_path):
+    ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                        str(tmp_path / "state.json"))
+    pair = ledger.ensure_pair(
+        pair_id="ARB-MANUAL", symbol="SNDK", venue_a="ENTROPY",
+        venue_b="RH", direction="buy_entropy", entry_time=1000.0)
+    data = fill("OPEN", buy_key="entropy", sell_key="hedge",
+                buy_px=100.0, sell_px=101.0)
+    data.update({
+        "buy_quote_usd": 1.0,
+        "sell_quote_usd": 0.99,
+        "funding_cost_bps": 2.0,
+        "stablecoin_basis_bps": 100.0,
+    })
+    ledger.record_fill(pair, data)
+    assert abs(pair.gross_pnl - 1.0) < 1e-12
+    assert abs(pair.stablecoin_basis_usd - (-1.01)) < 1e-12
+    assert abs(pair.fees - 0.19999) < 1e-12
+    assert abs(pair.expected_funding_cost - 0.02) < 1e-12
+    # Expected funding is a decision-time estimate, not booked PnL. Only the
+    # realized venue amount below enters net_pnl.
+    assert abs(pair.net_pnl - (-0.20999)) < 1e-12
+    pair.set_realized_funding(0.03)
+    assert abs(pair.net_pnl - (-0.23999)) < 1e-12
+
+
 def test_reconciliation_is_additive_and_marks_accounting_incomplete(tmp_path):
     ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
                         str(tmp_path / "state.json"))
@@ -86,3 +114,47 @@ def test_reconciliation_is_additive_and_marks_accounting_incomplete(tmp_path):
     assert ledger.current.reconciliation_adjustment_base == -0.5
     assert not ledger.current.accounting_complete
     assert "PAIR_RECONCILED" in (tmp_path / "pairs.jsonl").read_text()
+
+
+def test_snapshot_refuses_nonfinite_financial_state(tmp_path):
+    ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                        str(tmp_path / "state.json"))
+    pair = ledger.ensure_pair(
+        pair_id="ARB-NAN", symbol="SNDK", venue_a="ENTROPY",
+        venue_b="RH", direction="sell_entropy", entry_time=1000.0)
+    pair.net_pnl = float("nan")
+    with pytest.raises(ValueError):
+        ledger.snapshot()
+
+
+def test_restart_rejects_incomplete_snapshot_temporary_file(tmp_path):
+    events = tmp_path / "pairs.jsonl"
+    state = tmp_path / "state.json"
+    (tmp_path / "state.json.tmp").write_text('{"version":1', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="incomplete snapshot"):
+        PairLedger(str(events), str(state))
+
+
+def test_restart_rejects_nonfinite_json_state(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(
+        '{"version":1,"current":null,"completed":[],"runtime":{"x":NaN}}',
+        encoding="utf-8")
+    with pytest.raises(RuntimeError, match="non-finite"):
+        PairLedger(str(tmp_path / "pairs.jsonl"), str(state))
+
+
+def test_ledger_mutators_reject_nonfinite_values_before_state_change(tmp_path):
+    ledger = PairLedger(str(tmp_path / "pairs.jsonl"),
+                        str(tmp_path / "state.json"))
+    pair = ledger.ensure_pair(
+        pair_id="ARB-FINITE", symbol="SNDK", venue_a="ENTROPY",
+        venue_b="RH", direction="sell_entropy", entry_time=1000.0)
+    with pytest.raises(ValueError, match="finite"):
+        ledger.reconcile_current(float("nan"), "bad")
+    assert pair.remaining_base == 0.0
+    with pytest.raises(ValueError, match="finite"):
+        pair.set_realized_funding(float("inf"))
+    with pytest.raises(ValueError, match="finite"):
+        ledger.record_recovery(pair, gross_cashflow_usd=float("nan"),
+                               fees_usd=0.0, reason="bad")

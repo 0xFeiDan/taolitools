@@ -2,10 +2,28 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
+
+
+def _require_finite_tree(value: Any, path: str = "state") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise RuntimeError(f"non-finite number in persisted {path}")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _require_finite_tree(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _require_finite_tree(item, f"{path}[{index}]")
+
+
+def _require_optional_finite(*values: Optional[float]) -> None:
+    if not all(value is None or math.isfinite(float(value))
+               for value in values):
+        raise ValueError("optional accounting values must be finite")
 
 
 @dataclass
@@ -73,6 +91,18 @@ class PairPnL:
                    stablecoin_basis_bps: float,
                    market_session: Optional[str] = None,
                    at: Optional[float] = None) -> None:
+        numeric = (qty, buy_px, sell_px, planned_buy_px, planned_sell_px,
+                   buy_fee_rate, sell_fee_rate, buy_quote_usd,
+                   sell_quote_usd, funding_cost_bps,
+                   stablecoin_basis_bps)
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise ValueError("fill accounting values must be finite")
+        _require_optional_finite(spread_bps, z_score, midline_bps, at)
+        if (qty < 0 or buy_px <= 0 or sell_px <= 0
+                or planned_buy_px <= 0 or planned_sell_px <= 0
+                or buy_quote_usd <= 0 or sell_quote_usd <= 0
+                or buy_fee_rate < 0 or sell_fee_rate < 0):
+            raise ValueError("fill accounting values are out of range")
         if qty <= 0:
             return
         now = time.time() if at is None else at
@@ -123,6 +153,42 @@ class PairPnL:
                     self.funding_source = "estimated"
         self._recalculate_net()
 
+    def apply_unpriced_fill(self, *, action: str, qty: float,
+                            spread_bps: Optional[float],
+                            z_score: Optional[float],
+                            midline_bps: Optional[float],
+                            market_session: Optional[str] = None,
+                            at: Optional[float] = None) -> None:
+        """Persist matched quantity without inventing an execution price."""
+        qty = float(qty)
+        if not math.isfinite(qty) or qty <= 0:
+            raise ValueError("unpriced fill quantity must be finite and > 0")
+        _require_optional_finite(spread_bps, z_score, midline_bps, at)
+        now = time.time() if at is None else float(at)
+        if not math.isfinite(now):
+            raise ValueError("unpriced fill timestamp must be finite")
+        self.accounting_complete = False
+        if action == "EXIT":
+            self.exit_base += qty
+            self.remaining_base = max(self.remaining_base - qty, 0.0)
+            self.exit_spread = spread_bps
+            self.exit_z = z_score
+            self.exit_midline = midline_bps
+            self.exit_session = market_session
+            if self.remaining_base <= 1e-12:
+                self.complete = True
+                self.exit_time = now
+                self.holding_time = max(now - self.entry_time, 0.0)
+        else:
+            self.entry_base += qty
+            self.remaining_base += qty
+            if self.entry_spread is None:
+                self.entry_spread = spread_bps
+                self.entry_z = z_score
+                self.entry_midline = midline_bps
+                self.entry_session = market_session
+        self._recalculate_net()
+
     def _accumulate_vwap(self, buy_key: str, sell_key: str, qty: float,
                          buy_px: float, sell_px: float, *, entry: bool) -> None:
         a_px = buy_px if buy_key == "entropy" else sell_px
@@ -143,6 +209,8 @@ class PairPnL:
             self.leg_b_exit_vwap = self._leg_b_exit_notional / total
 
     def update_market(self, spread_bps: float) -> None:
+        if not math.isfinite(float(spread_bps)):
+            raise ValueError("market spread must be finite")
         if self.entry_spread is None or self.complete:
             return
         move = (self.entry_spread - spread_bps
@@ -152,7 +220,10 @@ class PairPnL:
         self.max_adverse_spread = max(self.max_adverse_spread, -move)
 
     def set_realized_funding(self, cost_usd: float) -> None:
-        self.funding = float(cost_usd)
+        cost_usd = float(cost_usd)
+        if not math.isfinite(cost_usd):
+            raise ValueError("realized funding must be finite")
+        self.funding = cost_usd
         self.funding_source = "venue"
         self._recalculate_net()
 
@@ -173,6 +244,11 @@ class PairLedger:
         self._load()
 
     def _load(self) -> None:
+        temporary = self.state_json + ".tmp"
+        if os.path.exists(temporary):
+            raise RuntimeError(
+                f"incomplete snapshot {temporary!r} exists; manual review "
+                "is required before live restart")
         try:
             with open(self.state_json, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -181,6 +257,7 @@ class PairLedger:
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"cannot restore runtime state "
                                f"{self.state_json!r}: {exc}") from exc
+        _require_finite_tree(data)
         if data.get("version") != self.VERSION:
             raise RuntimeError("unsupported pair ledger state version")
         if data.get("current"):
@@ -197,7 +274,7 @@ class PairLedger:
             os.makedirs(directory, exist_ok=True)
         with open(self.ledger_jsonl, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False,
-                                separators=(",", ":")) + "\n")
+                                separators=(",", ":"), allow_nan=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
 
@@ -230,11 +307,28 @@ class PairLedger:
         if pair.complete:
             self.append_event("PAIR_COMPLETED", pair.to_dict())
 
+    def record_unpriced_fill(self, pair: PairPnL,
+                             fill: Dict[str, Any]) -> None:
+        pair.apply_unpriced_fill(**fill)
+        if pair.complete:
+            self.completed.append(pair)
+            self.completed = self.completed[-200:]
+            self.current = None
+        self.snapshot()
+        self.append_event("PAIR_UNPRICED_FILL", {
+            "pair_id": pair.pair_id, **fill,
+            "accounting_complete": False})
+        if pair.complete:
+            self.append_event("PAIR_COMPLETED", pair.to_dict())
+
     def reconcile_current(self, remaining_base: float, reason: str) -> None:
         if self.current is None:
             return
         pair = self.current
-        new_remaining = max(float(remaining_base), 0.0)
+        remaining_base = float(remaining_base)
+        if not math.isfinite(remaining_base):
+            raise ValueError("reconciled quantity must be finite")
+        new_remaining = max(remaining_base, 0.0)
         pair.reconciliation_adjustment_base += new_remaining - pair.remaining_base
         pair.remaining_base = new_remaining
         pair.accounting_complete = False
@@ -257,9 +351,15 @@ class PairLedger:
     def record_recovery(self, pair: PairPnL, *, gross_cashflow_usd: float,
                         fees_usd: float, reason: str,
                         complete_if_flat: bool = False) -> None:
-        net = float(gross_cashflow_usd) - float(fees_usd)
-        pair.gross_pnl += float(gross_cashflow_usd)
-        pair.fees += float(fees_usd)
+        gross_cashflow_usd = float(gross_cashflow_usd)
+        fees_usd = float(fees_usd)
+        if (not math.isfinite(gross_cashflow_usd)
+                or not math.isfinite(fees_usd) or fees_usd < 0):
+            raise ValueError("recovery accounting values must be finite and "
+                             "fees non-negative")
+        net = gross_cashflow_usd - fees_usd
+        pair.gross_pnl += gross_cashflow_usd
+        pair.fees += fees_usd
         pair.recovery_pnl += net
         if complete_if_flat and pair.remaining_base <= 1e-12:
             pair.complete = True
@@ -293,7 +393,8 @@ class PairLedger:
             os.makedirs(directory, exist_ok=True)
         temporary = self.state_json + ".tmp"
         with open(temporary, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(temporary, self.state_json)

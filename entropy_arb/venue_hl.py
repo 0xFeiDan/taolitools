@@ -83,6 +83,7 @@ class HLVenue:
         self.book = OrderBook()
         self.position = 0.0
         self.cash = 0.0
+        self.accounting_complete = True
         self.volume_usd = 0.0     # cumulative filled notional this session
         self.equity = None
         self.free = None
@@ -191,8 +192,61 @@ class HLVenue:
         self._cloid += 1
         return Cloid.from_int(self._cloid)
 
+    @staticmethod
+    def _fill_summary_for_oid(fills, oid):
+        """Return (filled base, actual VWAP) for one exchange order id."""
+        if oid is None or not isinstance(fills, list):
+            return None
+        target = str(oid)
+        total_qty = total_notional = 0.0
+        seen_trade_ids = set()
+        for fill in fills:
+            if not isinstance(fill, dict) or str(fill.get("oid")) != target:
+                continue
+            trade_id = fill.get("tid")
+            if trade_id is not None:
+                trade_id = str(trade_id)
+                if trade_id in seen_trade_ids:
+                    continue
+                seen_trade_ids.add(trade_id)
+            try:
+                qty = float(fill.get("sz") or 0.0)
+                price = float(fill.get("px") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if (not math.isfinite(qty) or not math.isfinite(price)
+                    or qty <= 0 or price <= 0):
+                continue
+            total_qty += qty
+            total_notional += qty * price
+        if total_qty <= 0:
+            return None
+        return total_qty, total_notional / total_qty
+
+    async def _fetch_fill_summary(self, oid, order_send_ts: float):
+        if oid is None:
+            return None
+        try:
+            fills = await self._info({
+                "type": "userFillsByTime",
+                "user": self.account.query_address,
+                "startTime": max(int(order_send_ts * 1000) - 5000, 0),
+                "endTime": int(time.time() * 1000) + 1000,
+            })
+        except Exception:
+            return None
+        if isinstance(fills, dict):
+            fills = fills.get("fills")
+        return self._fill_summary_for_oid(fills, oid)
+
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False) -> dict:
+        if (not math.isfinite(float(qty)) or qty <= 0
+                or not math.isfinite(float(limit_px)) or limit_px <= 0):
+            return _timed_result({
+                "status": "preflight-rejected", "filled_base": 0.0,
+                "avg_px": None, "err": "qty and limit_px must be finite and > 0",
+                "unresolved": False})
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
         cloid = self._next_cloid()
@@ -211,7 +265,8 @@ class HLVenue:
         except Exception as e:
             return _timed_result({
                 "status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                "err": f"signing failed: {e!r}", "unresolved": False})
+                "err": f"signing failed: {type(e).__name__}",
+                "unresolved": False})
 
         order_send_ts = time.time()
         body, err, unresolved = await self._post_exchange(payload)
@@ -230,6 +285,7 @@ class HLVenue:
                     order_ack_ts=order_ack_ts, fill_ts=fill_ts)
         # unknown outcome: poll orderStatus by cloid until the deadline
         deadline = time.time() + self.settle_timeout
+        closed_without_price = None
         while time.time() < deadline:
             try:
                 st = await self._info({"type": "orderStatus",
@@ -246,15 +302,41 @@ class HLVenue:
                                  - float(inner.get("sz") or 0), 0.0)
                 except (TypeError, ValueError):
                     filled = 0.0
-                if status != "open":
+                terminal = status.lower().startswith(
+                    ("filled", "canceled", "cancelled", "rejected", "expired"))
+                if terminal:
                     observed_ts = time.time()
-                    return _timed_result(
-                        {"status": status, "filled_base": filled,
-                         "avg_px": None, "err": None, "unresolved": False},
-                        order_send_ts=order_send_ts,
-                        order_ack_ts=order_ack_ts or observed_ts,
-                        fill_ts=observed_ts if filled > 0 else None)
+                    if filled <= 0:
+                        return _timed_result(
+                            {"status": status, "filled_base": 0.0,
+                             "avg_px": None, "err": None,
+                             "unresolved": False,
+                             "accounting_complete": True},
+                            order_send_ts=order_send_ts,
+                            order_ack_ts=order_ack_ts or observed_ts)
+                    summary = await self._fetch_fill_summary(
+                        inner.get("oid"), order_send_ts)
+                    if summary is not None:
+                        history_qty, avg_px = summary
+                        return _timed_result(
+                            {"status": status, "filled_base": history_qty,
+                             "avg_px": avg_px, "err": None,
+                             "unresolved": False,
+                             "accounting_complete": True},
+                            order_send_ts=order_send_ts,
+                            order_ack_ts=order_ack_ts or observed_ts,
+                            fill_ts=observed_ts)
+                    closed_without_price = (status, filled, observed_ts)
             await asyncio.sleep(0.5)
+        if closed_without_price is not None:
+            status, filled, observed_ts = closed_without_price
+            return _timed_result(
+                {"status": status, "filled_base": filled,
+                 "avg_px": None, "err": None, "unresolved": False,
+                 "accounting_complete": False},
+                order_send_ts=order_send_ts,
+                order_ack_ts=order_ack_ts or observed_ts,
+                fill_ts=observed_ts)
         return _timed_result(
             {"status": "timeout", "filled_base": 0.0, "avg_px": None,
              "err": None, "unresolved": True},
@@ -267,9 +349,13 @@ class HLVenue:
                     timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT)) as r:
                 text = await r.text()
                 if r.status == 429:
-                    return None, f"RATE_LIMITED: HTTP 429 {text[:150]}", False
+                    # The request was already dispatched. A gateway/proxy 429
+                    # is not proof that the exchange never accepted it.
+                    return None, "RATE_LIMITED: HTTP 429", True
+                if r.status == 408:
+                    return None, None, True
                 if 400 <= r.status < 500:
-                    return None, f"HTTP {r.status}: {text[:250]}", False
+                    return None, f"HTTP {r.status}", False
                 if r.status >= 500:
                     return None, None, True
                 return json.loads(text), None, False
@@ -284,20 +370,32 @@ class HLVenue:
                 msg = "RATE_LIMITED: " + msg
             return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
                     "err": msg, "unresolved": False}
+        def unknown(msg: str) -> dict:
+            return {"status": "unknown-response", "filled_base": 0.0,
+                    "avg_px": None, "err": msg, "unresolved": True}
         if body.get("status") == "err":
             return fail(str(body.get("response")))
         if body.get("status") != "ok":
-            return fail(f"unexpected response: {str(body)[:200]}")
+            return unknown(f"unexpected response: {str(body)[:200]}")
         try:
             st = body["response"]["data"]["statuses"][0]
         except (KeyError, IndexError, TypeError):
-            return fail(f"malformed response: {str(body)[:200]}")
+            return unknown(f"malformed response: {str(body)[:200]}")
         if "filled" in st:
             f = st["filled"]
-            return {"status": "filled",
-                    "filled_base": float(f.get("totalSz") or 0.0),
-                    "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
-                    "err": None, "unresolved": False}
+            try:
+                qty = float(f.get("totalSz") or 0.0)
+                avg_px = float(f["avgPx"]) if f.get("avgPx") else None
+            except (KeyError, TypeError, ValueError):
+                return unknown("malformed filled response")
+            if (not math.isfinite(qty) or qty < 0
+                    or (qty > 0 and (avg_px is None
+                                     or not math.isfinite(avg_px)
+                                     or avg_px <= 0))):
+                return unknown("non-finite or incomplete filled response")
+            return {"status": "filled", "filled_base": qty,
+                    "avg_px": avg_px, "err": None, "unresolved": False,
+                    "accounting_complete": True}
         if "error" in st:
             msg = str(st["error"])
             if "could not immediately match" in msg.lower():
@@ -307,7 +405,7 @@ class HLVenue:
         if "resting" in st:
             return {"status": "resting?", "filled_base": 0.0, "avg_px": None,
                     "err": None, "unresolved": True}
-        return fail(f"unknown status: {str(st)[:150]}")
+        return unknown(f"unknown status: {str(st)[:150]}")
 
     # -------------------------------------------------------------- accounts
 

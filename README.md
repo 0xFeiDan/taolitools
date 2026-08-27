@@ -55,11 +55,17 @@ midline − lower  ────────────────────�
 
 In Static mode, both hurdles are applied to **executable** prices (entropy bid vs hedge ask,
 and vice versa) and are **net of both venues' taker fees** — the engine adds
-fees on top before a slice qualifies. A full round trip therefore nets
-**≥ upper + lower bps after fees by construction**.
+fees on top before a slice qualifies. These bands are signal distances in
+price-ratio space, **not an unconditional USD round-trip profit floor**. For
+example, with midline 5, upper 4, and lower 3, selling one base at
+Entropy/Hedge = 100.091/100 and later closing at 1000/999.801 satisfies both
+directional hurdles but loses about $0.108 before fees: the common price level
+rose tenfold. Slippage, funding, and quote/USD changes can reduce it further.
 
-One Static-mode consequence worth understanding: with `midline_bps: 5`, the buy-entropy
-hurdle is `lower − midline`, which can be **negative**. That is intentional —
+One Static-mode consequence worth understanding: with `midline_bps: 5`, the raw
+lower boundary is `midline − lower`. The executable BUY-entropy direction uses
+the exact reciprocal hedge/Entropy ratio (not merely `lower − midline`), which
+can still be **negative**. That is intentional —
 if entropy is persistently 5 bps rich, buying it at a 0 bps premium is 5 bps
 cheap versus its own equilibrium, and that trade is the profitable unwind of
 an earlier sell at `midline + upper`. It also means a **wrong midline loses
@@ -124,6 +130,11 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 Running without `--record-only` sends real orders immediately once both
 feeds are fresh and the band is crossed.
 
+`requirements-live.txt` is a development convenience, not a reproducible
+real-money lockfile: it currently contains lower-bounded packages and a Lighter
+SDK reference to the moving GitHub `main` branch. A real-money deployment must
+first pin locally audited package versions/commit SHAs and artifact hashes.
+
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
 executable premium of each direction against its full hurdle (fees and
@@ -174,19 +185,19 @@ errors), credentials in `.env`, and the markets on the command line
 | `regime.enabled` | pause new entries on a confirmed regime break | `true` in the example |
 | `entropy.dex` | Entropy's dex name on Hyperliquid | `io` |
 | `*.taker_fee_bps` | per-venue taker fee | 0.0 (tradexyz hedge: 1.0) |
-| `*.max_position_usd` | per-venue position cap | 1000 |
+| `*.max_position_usd` | per-venue position cap | 500 in the example |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |
-| `sizing.max_order_notional_usd` | per-slice cap | 500 |
+| `sizing.max_order_notional_usd` | legacy per-slice cap | 100 in the example |
 | `sizing.vwap_enabled` | current-orderbook VWAP + automatic sizing; `false` keeps legacy sizing | `true` in the example |
-| `sizing.min_order_usd` / `max_order_usd` | search range for automatic sizing | 1000 / 50000 |
+| `sizing.min_order_usd` / `max_order_usd` | search range for automatic sizing | 10 / 100 in the example |
 | `sizing.minimum_net_edge_bps` | minimum directional deviation after modeled costs | 6 |
 | `sizing.max_vwap_slippage_bps` / `max_book_impact_bps` | reject sizes that consume too much depth | 5 / 5 |
 | `sizing.safety_buffer_bps` / `expected_latency_cost_bps` | explicit deductions beyond fees and visible depth | 2 / 0 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
 | `execution.risk_recovery_enabled` / `hedge_timeout_ms` | one-leg timeout recovery | `true` / 250ms in the example |
-| `execution.max_unhedged_delta_usd` | delta threshold for emergency hedging | 5000 |
+| `execution.max_unhedged_delta_usd` | delta threshold for emergency hedging | 100 in the example |
 | `kill_switch.enabled` | unified risk-event and persistent entry-pause handling | `true` in the example |
 | `kill_switch.emergency_flatten_enabled` | allow reduce-only flatten after severe persistent risk | `false` |
 | `accounting.enabled` | durable Pair ledger and restart snapshot | `true` in the example |
@@ -207,8 +218,9 @@ when the order book itself last changed. With `enforce_book_age` enabled, a live
 heartbeat cannot make an old book tradable, and stale data disarms any pending
 signal.
 
-Hyperliquid's documented millisecond `time` on `l2Book` is used to observe
-exchange-to-local delay. The official Lighter order-book websocket currently
+Hyperliquid's documented millisecond `time` on `l2Book` is also checked against
+`max_book_age_ms`; stale exchange snapshots and implausibly future timestamps
+are rejected. The official Lighter order-book websocket currently
 does not expose a server timestamp, so only local receive time is recorded and
 exchange time remains unknown. Order ACK/fill timestamps are also local
 observation times, not matching-engine timestamps.
@@ -324,7 +336,8 @@ startup. Each new execution attempt also has an evented state machine. With
 `accounting.enabled`, the open Pair, the last 200 completed Pairs, execution
 events, risk events, persistent pauses, and pending emergency flatten are
 restored from an atomically replaced snapshot. Audit events are appended to
-JSONL and flushed to disk.
+JSONL and flushed to disk. Live mode requires this accounting ledger; an
+incomplete `.tmp` snapshot blocks restart for manual review.
 
 ### Pair PnL, funding, and quote-asset basis
 
@@ -334,7 +347,9 @@ expected and venue-reconciled funding, quote-basis adjustment, entry/exit
 slippage, entry/exit market session, gross/net PnL, holding time, and maximum
 adverse/favorable spread.
 
-Funding uses each venue's current rate. Hyperliquid's asset context is already
+Funding uses each venue's current rate and each leg's own USD-normalized
+notional; USDC and USDG amounts are never added as if they were identical.
+Hyperliquid's asset context is already
 hourly; Lighter's cross-exchange endpoint is documented as an 8-hour-equivalent
 rate and is divided by eight. The opening cost model applies the configured
 expected holding time. While a Pair is open, account funding history replaces
@@ -352,7 +367,12 @@ The example reads level-1 `ASSET-USD` books from Coinbase Exchange. A missing or
 stale source blocks OPEN/ADD. `warning_deviation_bps` is observable; crossing
 `halt_deviation_bps` pauses new exposure. Set each venue's `quote_asset`
 correctly; the defaults are USDC for Entropy/Lighter mainnet/trade.xyz and USDG
-for Lighter Robinhood.
+for Lighter Robinhood. The active midline hurdle is converted into the same
+directional USD ratio (including the reciprocal direction), so a USDG/USDC
+basis cannot move the executable edge without moving its hurdle. Live mode
+refuses non-USD quote assets unless fresh stablecoin conversion is enabled.
+Account/session PnL is reported as unavailable once that conversion is stale;
+an old USDG/USDC rate is never presented as current USD value.
 
 ## Credentials (`.env`, live only)
 
@@ -373,6 +393,13 @@ for Lighter Robinhood.
   with average-price protection settling on the authenticated account
   websocket; Hyperliquid IOC limits settling synchronously (with
   orderStatus polling for unknown outcomes).
+- **Fail-closed order outcomes**: an unresolved result persistently pauses
+  OPEN/ADD before the venue locks are released. Only reconciliation, EXIT,
+  and reduce-only recovery remain available until an operator verifies flat
+  positions and explicitly clears the pause.
+- **Reduce-only EXIT**: both EXIT legs are always sent with
+  `reduce_only=true`; stale local Pair quantity can cause a safe rejection,
+  but cannot reverse a venue position into a new exposure.
 - A **persistence gate** (`premium_persist_sec`) arms each direction and only
   fires if the edge survives — one-tick phantoms are filtered.
 - **Inventory ladder**: past `floor_frac` of a venue's cap, adding to the
@@ -380,6 +407,9 @@ for Lighter Robinhood.
 - **Net-delta hedge**: if legs fill unevenly, the imbalance is immediately
   reduced (reduce-only, price-protected), and positions are reconciled
   against the chain every `reconcile_sec`.
+- **Startup position guard**: the first strict position reconciliation runs
+  before strategy tasks are created. Any unmatched base position creates a
+  persistent entry pause and schedules reduce-only recovery.
 - **One-leg timeout recovery**: with `risk_recovery_enabled`, both order tasks
   remain tracked. If only one OPEN/ADD leg has a confirmed fill by
   `hedge_timeout_ms`, the engine immediately sends a reduce-only reversal on
@@ -389,6 +419,10 @@ for Lighter Robinhood.
   venue is probed every `venue_probe_sec`. With the Kill Switch enabled,
   repeated execution failures pause new entries instead of continuing to add
   exposure.
+- **Auditable fill prices**: Hyperliquid timeout/5xx recovery obtains actual
+  fills by exchange order ID and computes fill-history VWAP. If quantity is
+  known but actual price remains unavailable, Pair accounting is marked
+  incomplete and OPEN/ADD stays persistently paused.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 
@@ -415,8 +449,9 @@ because the counterpart may still settle afterward.
 The runtime records typed risk events with one of `PAUSE_NEW_ENTRY`,
 `EMERGENCY_HEDGE`, or `EMERGENCY_FLATTEN`:
 
-- persistent net delta above `max_unhedged_delta_usd` for longer than
-  `max_unhedged_duration_ms`;
+- net delta above `max_unhedged_delta_usd` immediately blocks OPEN/ADD and
+  requests emergency hedging; exceeding `max_unhedged_duration_ms` makes that
+  pause persistent. If either leg cannot be priced, the timer keeps running;
 - consecutive unequal/partial fills;
 - consecutive execution failures;
 - chain/local position reconciliation mismatch;
@@ -431,6 +466,9 @@ flatten is deliberately disabled by default. When enabled, a failed, locked,
 bookless, or disconnected venue remains a persisted pending task and is retried
 every `emergency_flatten_retry_sec`; zero max attempts means retry until flat.
 No client can guarantee a fill while an external exchange is unavailable.
+Shutdown waits only for a bounded period. Any execution still in flight is
+persisted as unknown and blocks OPEN/ADD on restart; any restored non-terminal
+execution state also requires reconciliation before new exposure is allowed.
 
 Example operator reset after independently confirming that both venues are
 flat (this performs live reconciliation; it is intentionally unavailable in
@@ -471,6 +509,8 @@ tests/                   python3 -m pytest tests/
 - **Quote-source basis**: the independent basis guard removes known quote/USD
   movement, but the external spot source can itself be stale, unavailable, or
   less executable than its top of book. Enabled stale data blocks new entries.
+  VWAP order bounds, venue position caps, delta/reconciliation limits, volume,
+  account delta, and session MTM are converted with the same live rate.
 - **Funding forecast error**: the entry model extrapolates the current rate for
   `expected_holding_hours`; future hourly rates can change. Venue history is
   reconciled into Pair PnL after the fact, not predicted perfectly.

@@ -35,6 +35,10 @@ class DynamicMidline:
                  volatility_method: str,
                  volatility_window_seconds: float,
                  volatility_floor_bps: float) -> None:
+        numeric = (fast_window_seconds, slow_window_seconds,
+                   volatility_window_seconds, volatility_floor_bps)
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise ValueError("midline limits must be finite")
         if fast_window_seconds <= 0 or slow_window_seconds <= 0:
             raise ValueError("midline windows must be > 0")
         if volatility_window_seconds <= 0 or volatility_floor_bps <= 0:
@@ -140,6 +144,17 @@ class RegimeDetector:
                  max_z_score: float, max_absolute_spread_bps: float,
                  break_persist_seconds: float,
                  recovery_persist_seconds: float) -> None:
+        numeric = (max_fast_slow_difference_bps, max_z_score,
+                   max_absolute_spread_bps, break_persist_seconds,
+                   recovery_persist_seconds)
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise ValueError("regime limits must be finite")
+        if (max_fast_slow_difference_bps <= 0 or max_z_score <= 0
+                or max_absolute_spread_bps <= 0
+                or break_persist_seconds < 0
+                or recovery_persist_seconds < 0):
+            raise ValueError("regime thresholds must be positive and "
+                             "persistence durations non-negative")
         self.max_fast_slow_difference_bps = max_fast_slow_difference_bps
         self.max_z_score = max_z_score
         self.max_absolute_spread_bps = max_absolute_spread_bps
@@ -165,6 +180,11 @@ class RegimeDetector:
     def update(self, stats: SpreadStats, now: Optional[float] = None
                ) -> RegimeStatus:
         now = stats.timestamp if now is None else float(now)
+        numeric = (now, stats.timestamp, stats.spread_bps,
+                   stats.fast_midline_bps, stats.slow_midline_bps,
+                   stats.volatility_bps, stats.deviation_bps, stats.z_score)
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise ValueError("regime status values must be finite")
         reasons = []
         if abs(stats.fast_midline_bps - stats.slow_midline_bps) \
                 > self.max_fast_slow_difference_bps:

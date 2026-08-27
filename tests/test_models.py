@@ -1,6 +1,8 @@
 """V2 foundation models: IDs, state transitions, timing, and risk events."""
 from datetime import datetime, timezone
 
+import pytest
+
 from entropy_arb.models import (
     ExecutionState,
     LatencyTimeline,
@@ -129,3 +131,13 @@ def test_pair_position_rejects_opposite_add():
         assert "opposite direction" in str(exc)
     else:
         raise AssertionError("opposite add must be rejected")
+
+
+def test_pair_position_rejects_nonfinite_quantities():
+    pair = PairPosition()
+    with pytest.raises(ValueError, match="finite"):
+        pair.add(PairDirection.BUY_ENTROPY, float("nan"))
+    pair.add(PairDirection.BUY_ENTROPY, 1.0)
+    with pytest.raises(ValueError, match="finite"):
+        pair.reduce(float("inf"))
+    assert pair.base_qty == 1.0

@@ -16,12 +16,16 @@ Threshold model (fixed numbers the user derives from recorded minute data):
     BUY entropy / SELL hedge  fires when the executable premium
         (entropy ask under hedge bid) <= midline_bps - lower_bps
 
-    Both hurdles are net of both venues' taker fees, so a full round trip
-    nets >= (upper_bps + lower_bps) after fees by construction.
+    Both directional hurdles include both venues' taker fees.  They define
+    signal distance in ratio/bps space; they are not an unconditional USD
+    round-trip profit guarantee because the common price level, fills,
+    funding, and quote/USD rates can change between entry and exit.
 """
 from __future__ import annotations
 
+import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -32,6 +36,9 @@ HL_API_URL = "https://api.hyperliquid.xyz"
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
 
 HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
+MAX_CONFIG_BPS = 100_000.0
+MAX_CONFIG_USD = 1_000_000_000_000.0
+MAX_CONFIG_SECONDS = 365.0 * 24.0 * 60.0 * 60.0
 
 
 @dataclass(frozen=True)
@@ -192,8 +199,8 @@ class StablecoinConfig:
 class SessionConfig:
     """One-switch market-session contract.
 
-    Disabled is 24/7 crypto behavior. Enabled is US-equity regular-session
-    entry gating; the schedule itself is intentionally not user-configurable.
+    Disabled is one 24/7 crypto statistics pool. Enabled selects four
+    independent stock-perpetual statistics regimes without gating trading.
     """
 
     enabled: bool
@@ -427,6 +434,8 @@ def _validate(node: Any, schema: Dict[str, Any], path: str = "") -> None:
         elif want is float:
             if not isinstance(val, (int, float)) or isinstance(val, bool):
                 raise ConfigError(f"'{here}' must be a number, got {val!r}")
+            if not math.isfinite(float(val)):
+                raise ConfigError(f"'{here}' must be finite, got {val!r}")
         elif want is int:
             if not isinstance(val, int) or isinstance(val, bool):
                 raise ConfigError(f"'{here}' must be an integer, got {val!r}")
@@ -452,15 +461,29 @@ def _choice(value: str, valid: tuple[str, ...], path: str) -> str:
 
 def _positive(value: Any, path: str) -> float:
     result = float(value)
-    if result <= 0:
+    if not math.isfinite(result) or result <= 0:
         raise ConfigError(f"'{path}' must be > 0, got {value!r}")
     return result
 
 
 def _nonnegative(value: Any, path: str) -> float:
     result = float(value)
-    if result < 0:
+    if not math.isfinite(result) or result < 0:
         raise ConfigError(f"'{path}' must be >= 0, got {value!r}")
+    return result
+
+
+def _less_than(value: Any, ceiling: float, path: str) -> float:
+    result = _nonnegative(value, path)
+    if result >= ceiling:
+        raise ConfigError(f"'{path}' must be < {ceiling:g}, got {value!r}")
+    return result
+
+
+def _at_most(value: Any, ceiling: float, path: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result > ceiling:
+        raise ConfigError(f"'{path}' must be <= {ceiling:g}, got {value!r}")
     return result
 
 
@@ -473,7 +496,15 @@ def _env_s(name: str) -> Optional[str]:
 
 def _env_i(name: str) -> Optional[int]:
     v = os.getenv(name)
-    return int(v) if v not in (None, "") else None
+    if v in (None, ""):
+        return None
+    try:
+        result = int(v)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a non-negative integer") from exc
+    if result < 0:
+        raise ConfigError(f"{name} must be a non-negative integer")
+    return result
 
 
 # -------------------------------------------------------------------- loading
@@ -506,16 +537,92 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             raise ConfigError(f"'thresholds.{k}' is required — derive it from "
                               f"recorded minute data / 必须填写，请用采集的分钟"
                               f"数据计算后填入")
-    upper, lower = float(thr["upper_bps"]), float(thr["lower_bps"])
-    if upper <= 0 or lower <= 0:
-        raise ConfigError("thresholds.upper_bps and lower_bps must be > 0 "
-                          "(the round trip nets upper+lower bps after fees)")
+    upper = _positive(thr["upper_bps"], "thresholds.upper_bps")
+    lower = _positive(thr["lower_bps"], "thresholds.lower_bps")
+    _at_most(upper, MAX_CONFIG_BPS, "thresholds.upper_bps")
+    _at_most(lower, MAX_CONFIG_BPS, "thresholds.lower_bps")
+    static_midline = float(thr["midline_bps"])
+    if abs(static_midline) > MAX_CONFIG_BPS:
+        raise ConfigError(f"'thresholds.midline_bps' must be within "
+                          f"+/-{MAX_CONFIG_BPS:g}")
+    if static_midline <= -10000.0:
+        raise ConfigError("'thresholds.midline_bps' must be > -10000 so it "
+                          "represents a positive price ratio")
+    if static_midline - lower <= -10000.0:
+        raise ConfigError("'thresholds.midline_bps - lower_bps' must be "
+                          "> -10000 so the lower price-ratio boundary is "
+                          "positive")
 
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
     if not 0.0 < take_fraction <= 1.0:
         raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
                           "more than the profitable depth loses money on the "
                           "tail / 必须在 (0, 1] 之间")
+
+    max_order_notional = _positive(
+        _get(raw, "sizing", "max_order_notional_usd", 500.0),
+        "sizing.max_order_notional_usd")
+    _at_most(max_order_notional, MAX_CONFIG_USD,
+             "sizing.max_order_notional_usd")
+    min_order_notional = _positive(
+        _get(raw, "sizing", "min_order_notional_usd", 10.0),
+        "sizing.min_order_notional_usd")
+    _at_most(min_order_notional, MAX_CONFIG_USD,
+             "sizing.min_order_notional_usd")
+    if min_order_notional > max_order_notional:
+        raise ConfigError("sizing.min_order_notional_usd must be <= "
+                          "max_order_notional_usd")
+    inventory_scale_bps = _nonnegative(
+        _get(raw, "inventory", "scale_bps", 10.0),
+        "inventory.scale_bps")
+    inventory_floor_frac = _nonnegative(
+        _get(raw, "inventory", "floor_frac", 0.5),
+        "inventory.floor_frac")
+    if inventory_floor_frac > 1.0:
+        raise ConfigError("'inventory.floor_frac' must be <= 1")
+
+    premium_persist_sec = _nonnegative(
+        _get(raw, "execution", "premium_persist_sec", 0.3),
+        "execution.premium_persist_sec")
+    cooldown_sec = _nonnegative(
+        _get(raw, "execution", "cooldown_sec", 0.0),
+        "execution.cooldown_sec")
+    settle_timeout_sec = _positive(
+        _get(raw, "execution", "settle_timeout_sec", 5.0),
+        "execution.settle_timeout_sec")
+    leg_slippage_bps = _less_than(
+        _get(raw, "execution", "leg_slippage_bps", 50.0), 10000.0,
+        "execution.leg_slippage_bps")
+    hedge_slippage_bps = _less_than(
+        _get(raw, "execution", "hedge_slippage_bps", 20.0), 10000.0,
+        "execution.hedge_slippage_bps")
+    net_tolerance_base = _positive(
+        _get(raw, "execution", "net_tolerance_base", 0.001),
+        "execution.net_tolerance_base")
+    max_consecutive_errors = int(_get(
+        raw, "execution", "max_consecutive_errors", 3))
+    if max_consecutive_errors <= 0:
+        raise ConfigError("'execution.max_consecutive_errors' must be > 0")
+    rate_limit_pause_sec = _nonnegative(
+        _get(raw, "execution", "rate_limit_pause_sec", 10.0),
+        "execution.rate_limit_pause_sec")
+    staleness_sec = _positive(
+        _get(raw, "execution", "staleness_sec", 10.0),
+        "execution.staleness_sec")
+    _at_most(staleness_sec, MAX_CONFIG_SECONDS,
+             "execution.staleness_sec")
+    reconcile_sec = _positive(
+        _get(raw, "execution", "reconcile_sec", 15.0),
+        "execution.reconcile_sec")
+    venue_probe_sec = _positive(
+        _get(raw, "execution", "venue_probe_sec", 30.0),
+        "execution.venue_probe_sec")
+    http_keepalive_sec = _nonnegative(
+        _get(raw, "execution", "http_keepalive_sec", 10.0),
+        "execution.http_keepalive_sec")
+    status_interval_sec = _positive(
+        _get(raw, "logging", "status_interval_sec", 30.0),
+        "logging.status_interval_sec")
 
     midline = MidlineConfig(
         mode=_choice(_get(raw, "midline", "mode", "static"),
@@ -610,6 +717,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     )
     if vwap_sizing.min_order_usd > vwap_sizing.max_order_usd:
         raise ConfigError("sizing.min_order_usd must be <= sizing.max_order_usd")
+    _at_most(vwap_sizing.min_order_usd, MAX_CONFIG_USD,
+             "sizing.min_order_usd")
+    _at_most(vwap_sizing.max_order_usd, MAX_CONFIG_USD,
+             "sizing.max_order_usd")
 
     execution_risk = ExecutionRiskConfig(
         enabled=bool(_get(raw, "execution", "risk_recovery_enabled", False)),
@@ -704,22 +815,77 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("funding/stablecoin cost modeling requires "
                           "sizing.vwap_enabled: true")
 
+    for value, path in (
+        (premium_persist_sec, "execution.premium_persist_sec"),
+        (cooldown_sec, "execution.cooldown_sec"),
+        (settle_timeout_sec, "execution.settle_timeout_sec"),
+        (rate_limit_pause_sec, "execution.rate_limit_pause_sec"),
+        (reconcile_sec, "execution.reconcile_sec"),
+        (venue_probe_sec, "execution.venue_probe_sec"),
+        (http_keepalive_sec, "execution.http_keepalive_sec"),
+        (status_interval_sec, "logging.status_interval_sec"),
+        (funding.expected_holding_hours, "funding.expected_holding_hours"),
+        (funding.refresh_seconds, "funding.refresh_seconds"),
+        (funding.max_age_seconds, "funding.max_age_seconds"),
+        (stablecoin.refresh_seconds, "stablecoin.refresh_seconds"),
+        (stablecoin.max_age_seconds, "stablecoin.max_age_seconds"),
+    ):
+        _at_most(value, MAX_CONFIG_SECONDS, path)
+    for value, path in (
+        (execution_risk.max_unhedged_delta_usd,
+         "execution.max_unhedged_delta_usd"),
+        (kill_switch.max_reconcile_mismatch_usd,
+         "kill_switch.max_reconcile_mismatch_usd"),
+        (kill_switch.max_session_loss_usd,
+         "kill_switch.max_session_loss_usd"),
+    ):
+        _at_most(value, MAX_CONFIG_USD, path)
+
     session = SessionConfig(
         enabled=bool(_get(raw, "session", "enabled", False)))
 
     entropy_dex = _get(raw, "entropy", "dex", "io")
+    if entropy_dex != "io":
+        raise ConfigError("'entropy.dex' must be 'io' for the fixed Entropy "
+                          "leg")
     if hedge_venue == "tradexyz" and entropy_dex == "xyz":
         raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
                           "the same market on both legs / 两条腿是同一个市场")
 
     entropy_hl_creds = HLCreds(_env_s("HL_PRIVATE_KEY"),
                                _env_s("HL_ACCOUNT_ADDRESS"))
+    entropy_fee_bps = _less_than(
+        _get(raw, "entropy", "taker_fee_bps", 0.0), 10000.0,
+        "entropy.taker_fee_bps")
+    entropy_cap_usd = _positive(
+        _get(raw, "entropy", "max_position_usd", 1000.0),
+        "entropy.max_position_usd")
+    _at_most(entropy_cap_usd, MAX_CONFIG_USD,
+             "entropy.max_position_usd")
+    entropy_orders_per_min = int(_get(
+        raw, "entropy", "max_orders_per_min", 120))
+    if entropy_orders_per_min <= 0:
+        raise ConfigError("'entropy.max_orders_per_min' must be > 0")
+    hedge_fee_bps = _less_than(
+        _get(raw, "hedge", "taker_fee_bps",
+             1.0 if hedge_venue == "tradexyz" else 0.0),
+        10000.0, "hedge.taker_fee_bps")
+    hedge_cap_usd = _positive(
+        _get(raw, "hedge", "max_position_usd", 1000.0),
+        "hedge.max_position_usd")
+    _at_most(hedge_cap_usd, MAX_CONFIG_USD,
+             "hedge.max_position_usd")
+    hedge_orders_per_min = int(_get(
+        raw, "hedge", "max_orders_per_min",
+        120 if hedge_venue == "tradexyz" else 30))
+    if hedge_orders_per_min <= 0:
+        raise ConfigError("'hedge.max_orders_per_min' must be > 0")
     entropy = VenueConf(
         key="entropy", kind="hl", label="ENTROPY",
         symbol=symbol,
-        fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
-        cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
-        orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
+        fee_bps=entropy_fee_bps,
+        cap_usd=entropy_cap_usd,
+        orders_per_min=entropy_orders_per_min,
         quote_asset=str(_get(raw, "entropy", "quote_asset", "USDC")).upper(),
         hl_dex=entropy_dex,
         hl_creds=entropy_hl_creds,
@@ -729,9 +895,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         hedge = VenueConf(
             key="hedge", kind="hl", label="XYZ",
             symbol=symbol,
-            fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
-            cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
-            orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
+            fee_bps=hedge_fee_bps,
+            cap_usd=hedge_cap_usd,
+            orders_per_min=hedge_orders_per_min,
             quote_asset=str(_get(raw, "hedge", "quote_asset", "USDC")).upper(),
             hl_dex="xyz",
             hl_creds=HLCreds(
@@ -743,9 +909,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             key="hedge", kind="lighter",
             label="LIGHTER" if hedge_venue == "lighter" else "RH",
             symbol=symbol,
-            fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
-            cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
-            orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
+            fee_bps=hedge_fee_bps,
+            cap_usd=hedge_cap_usd,
+            orders_per_min=hedge_orders_per_min,
             quote_asset=str(_get(
                 raw, "hedge", "quote_asset",
                 "USDG" if hedge_venue == "lighter-rh" else "USDC")).upper(),
@@ -756,36 +922,40 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         )
     if not entropy.quote_asset.strip() or not hedge.quote_asset.strip():
         raise ConfigError("venue quote_asset must not be empty")
+    for venue in (entropy, hedge):
+        if not re.fullmatch(r"[A-Z0-9]{2,16}", venue.quote_asset):
+            raise ConfigError("venue quote_asset must contain only 2-16 "
+                              "uppercase letters or digits")
 
     return Config(
         symbol=symbol,
         hedge_venue=hedge_venue,
         entropy=entropy,
         hedge=hedge,
-        midline_bps=float(thr["midline_bps"]),
+        midline_bps=static_midline,
         upper_bps=upper,
         lower_bps=lower,
         take_fraction=take_fraction,
-        max_order_notional=float(_get(raw, "sizing", "max_order_notional_usd", 500.0)),
-        min_order_notional=float(_get(raw, "sizing", "min_order_notional_usd", 10.0)),
-        inventory_scale_bps=float(_get(raw, "inventory", "scale_bps", 10.0)),
-        inventory_floor_frac=float(_get(raw, "inventory", "floor_frac", 0.5)),
-        premium_persist_sec=float(_get(raw, "execution", "premium_persist_sec", 0.3)),
-        cooldown_sec=float(_get(raw, "execution", "cooldown_sec", 0.0)),
-        settle_timeout_sec=float(_get(raw, "execution", "settle_timeout_sec", 5.0)),
-        leg_slippage_bps=float(_get(raw, "execution", "leg_slippage_bps", 50.0)),
-        hedge_slippage_bps=float(_get(raw, "execution", "hedge_slippage_bps", 20.0)),
-        net_tolerance_base=float(_get(raw, "execution", "net_tolerance_base", 0.001)),
-        max_consecutive_errors=int(_get(raw, "execution", "max_consecutive_errors", 3)),
-        rate_limit_pause_sec=float(_get(raw, "execution", "rate_limit_pause_sec", 10.0)),
-        staleness_sec=float(_get(raw, "execution", "staleness_sec", 10.0)),
-        reconcile_sec=float(_get(raw, "execution", "reconcile_sec", 15.0)),
-        venue_probe_sec=float(_get(raw, "execution", "venue_probe_sec", 30.0)),
-        http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
+        max_order_notional=max_order_notional,
+        min_order_notional=min_order_notional,
+        inventory_scale_bps=inventory_scale_bps,
+        inventory_floor_frac=inventory_floor_frac,
+        premium_persist_sec=premium_persist_sec,
+        cooldown_sec=cooldown_sec,
+        settle_timeout_sec=settle_timeout_sec,
+        leg_slippage_bps=leg_slippage_bps,
+        hedge_slippage_bps=hedge_slippage_bps,
+        net_tolerance_base=net_tolerance_base,
+        max_consecutive_errors=max_consecutive_errors,
+        rate_limit_pause_sec=rate_limit_pause_sec,
+        staleness_sec=staleness_sec,
+        reconcile_sec=reconcile_sec,
+        venue_probe_sec=venue_probe_sec,
+        http_keepalive_sec=http_keepalive_sec,
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
-        status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
+        status_interval_sec=status_interval_sec,
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Callable, Optional
 
@@ -30,6 +31,7 @@ except ImportError:
 from .book import OrderBook
 
 log = logging.getLogger("feeds")
+MAX_EXCHANGE_FUTURE_SKEW_SEC = 5.0
 
 
 def _epoch_seconds(value) -> Optional[float]:
@@ -39,6 +41,8 @@ def _epoch_seconds(value) -> Optional[float]:
     try:
         ts = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts):
         return None
     magnitude = abs(ts)
     if magnitude >= 1e17:       # nanoseconds
@@ -93,7 +97,21 @@ class LighterBookFeed:
             return
         ob = msg["order_book"]
         if snapshot:
-            self._nonce = ob.get("nonce")
+            try:
+                snapshot_nonce = int(ob["nonce"])
+            except (KeyError, TypeError, ValueError):
+                self._nonce = None
+                self._synced = False
+                self.book.clear()
+                self.book.mark_connected()
+                log.warning("[%s] snapshot missing a valid nonce; ignored",
+                            self.name)
+                self.notify()
+                return
+            if (self._synced and self._nonce is not None
+                    and snapshot_nonce <= self._nonce):
+                return
+            self._nonce = snapshot_nonce
             self._synced = True
             self.book.apply_lighter(
                 ob, snapshot=True, received_ts=received_ts,
@@ -106,7 +124,27 @@ class LighterBookFeed:
         # a fiction. Drop it and resubscribe rather than quote off a ghost.
         if not self._synced:
             return  # no snapshot yet (fresh connection, or one pending after a gap)
-        prev, begin, end = self._nonce, ob.get("begin_nonce"), ob.get("nonce")
+        prev = self._nonce
+        try:
+            begin = int(ob["begin_nonce"])
+            end = int(ob["nonce"])
+        except (KeyError, TypeError, ValueError):
+            begin = end = None
+        if prev is not None and end is not None and end <= prev:
+            # A duplicate or late diff must never roll a newer book back.
+            return
+        if begin is None or end is None or end < begin:
+            log.warning("[%s] invalid diff nonce range; resubscribing",
+                        self.name)
+            self._nonce = None
+            self._synced = False
+            self.book.clear()
+            self.book.mark_connected()
+            self.notify()
+            await ws.send(json.dumps({"type": "unsubscribe",
+                                      "channel": f"order_book/{self.market_id}"}))
+            await self._subscribe(ws)
+            return
         if prev is not None and begin is not None and begin > prev + 1:
             log.warning("[%s] diff gap (had %s, got %s) — resubscribing",
                         self.name, prev, begin)
@@ -119,8 +157,7 @@ class LighterBookFeed:
                                       "channel": f"order_book/{self.market_id}"}))
             await self._subscribe(ws)
             return
-        if end is not None:
-            self._nonce = end
+        self._nonce = end
         self.book.apply_lighter(
             ob, snapshot=False, received_ts=received_ts,
             exchange_ts=_lighter_exchange_ts(msg, ob))
@@ -191,9 +228,19 @@ class HLBookFeed:
         if msg.get("channel") == "l2Book":
             d = msg.get("data") or {}
             if d.get("coin") == self.coin:
+                exchange_ts = _epoch_seconds(d.get("time"))
+                if exchange_ts is None:
+                    return
+                if exchange_ts > received_ts + MAX_EXCHANGE_FUTURE_SKEW_SEC:
+                    log.warning("[%s] future exchange timestamp ignored",
+                                self.name)
+                    return
+                if (self.book.exchange_ts is not None
+                        and exchange_ts <= self.book.exchange_ts):
+                    return
                 self.book.apply_hl(
                     d["levels"], received_ts=received_ts,
-                    exchange_ts=_epoch_seconds(d.get("time")))
+                    exchange_ts=exchange_ts)
                 if not self._snapped:
                     self._snapped = True
                     log.info("[%s] snapshot: %d bids / %d asks", self.name,

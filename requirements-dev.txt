@@ -2,3 +2,4 @@
 # 本地开发与单元测试；不会安装任何实盘签名 SDK。
 -r requirements.txt
 pytest>=8,<10
+hypothesis>=6,<7

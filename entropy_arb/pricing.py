@@ -13,6 +13,22 @@ from typing import List, Optional, Tuple
 Level = Tuple[float, float]
 
 
+def _clean_levels(levels: List[Level], *, reverse: bool) -> List[Level]:
+    """Return finite, positive price/size levels in execution order."""
+    usable: List[Level] = []
+    for px, size in levels:
+        try:
+            px_value = float(px)
+            size_value = float(size)
+        except (TypeError, ValueError):
+            continue
+        if (math.isfinite(px_value) and math.isfinite(size_value)
+                and px_value > 0 and size_value > 0):
+            usable.append((px_value, size_value))
+    usable.sort(key=lambda level: level[0], reverse=reverse)
+    return usable
+
+
 @dataclass(frozen=True)
 class VwapFill:
     side: str
@@ -90,11 +106,9 @@ def simulate_vwap(levels: List[Level], qty: float, *,
     """Walk one side of a current book for a common base quantity."""
     if side not in ("buy", "sell"):
         raise ValueError("side must be 'buy' or 'sell'")
-    if qty <= 0:
-        raise ValueError("qty must be > 0")
-    usable = [(float(px), float(size)) for px, size in levels
-              if px > 0 and size > 0]
-    usable.sort(key=lambda level: level[0], reverse=side == "sell")
+    if not math.isfinite(float(qty)) or qty <= 0:
+        raise ValueError("qty must be finite and > 0")
+    usable = _clean_levels(levels, reverse=side == "sell")
     if not usable:
         return None
 
@@ -136,6 +150,9 @@ def executable_edge(asks: List[Level], bids: List[Level], qty: float, *,
                     safety_buffer_bps: float = 0.0,
                     expected_latency_cost_bps: float = 0.0,
                     funding_cost_bps: float = 0.0,
+                    buy_funding_rate: Optional[float] = None,
+                    sell_funding_rate: Optional[float] = None,
+                    expected_holding_hours: float = 0.0,
                     stablecoin_basis_cost_bps: float = 0.0,
                     buy_quote_usd: float = 1.0,
                     sell_quote_usd: float = 1.0,
@@ -145,16 +162,49 @@ def executable_edge(asks: List[Level], bids: List[Level], qty: float, *,
     if buy is None or sell is None or not (buy.complete and sell.complete):
         return None
 
+    numeric = (
+        qty, buy_fee_bps, sell_fee_bps, safety_buffer_bps,
+        expected_latency_cost_bps, funding_cost_bps,
+        stablecoin_basis_cost_bps, buy_quote_usd, sell_quote_usd,
+        expected_holding_hours)
+    if not all(math.isfinite(float(value)) for value in numeric):
+        raise ValueError("all executable-edge inputs must be finite")
     if buy_quote_usd <= 0 or sell_quote_usd <= 0:
         raise ValueError("quote USD rates must be > 0")
+    if expected_holding_hours < 0:
+        raise ValueError("expected_holding_hours must be >= 0")
     buy_fee = buy_fee_bps / 1e4
     sell_fee = sell_fee_bps / 1e4
-    extra_cost_bps = (safety_buffer_bps + expected_latency_cost_bps
-                      + funding_cost_bps + stablecoin_basis_cost_bps)
     buy_usd = buy.notional_usd * buy_quote_usd
     sell_usd = sell.notional_usd * sell_quote_usd
     fee_usd = buy_usd * buy_fee + sell_usd * sell_fee
-    extra_usd = buy_usd * extra_cost_bps / 1e4
+    if (buy_funding_rate is None) != (sell_funding_rate is None):
+        raise ValueError("both per-leg funding rates must be provided together")
+    if buy_funding_rate is not None:
+        if not (math.isfinite(float(buy_funding_rate))
+                and math.isfinite(float(sell_funding_rate))):
+            raise ValueError("per-leg funding rates must be finite")
+        funding_usd = (
+            buy_usd * float(buy_funding_rate)
+            - sell_usd * float(sell_funding_rate)
+        ) * expected_holding_hours
+        effective_funding_bps = funding_usd / buy_usd * 1e4
+    else:
+        effective_funding_bps = funding_cost_bps
+        funding_usd = buy_usd * effective_funding_bps / 1e4
+    other_cost_bps = (safety_buffer_bps + expected_latency_cost_bps
+                      + stablecoin_basis_cost_bps)
+    buy_weight = (1.0 + buy_fee + other_cost_bps / 1e4
+                  + (float(buy_funding_rate) * expected_holding_hours
+                     if buy_funding_rate is not None else
+                     effective_funding_bps / 1e4))
+    sell_weight = (1.0 - sell_fee
+                   + (float(sell_funding_rate) * expected_holding_hours
+                      if sell_funding_rate is not None else 0.0))
+    if buy_weight <= 0 or sell_weight <= 0:
+        raise ValueError("modeled cost coefficients must remain positive")
+    extra_cost_bps = other_cost_bps + effective_funding_bps
+    extra_usd = buy_usd * other_cost_bps / 1e4 + funding_usd
     expected_profit = (sell_usd - buy_usd
                        - fee_usd - extra_usd)
     raw_gross_bps = (sell.vwap / buy.vwap - 1.0) * 1e4
@@ -165,7 +215,7 @@ def executable_edge(asks: List[Level], bids: List[Level], qty: float, *,
         gross_edge_bps=raw_gross_bps,
         adjusted_gross_edge_bps=adjusted_gross_bps,
         stablecoin_basis_bps=raw_gross_bps - adjusted_gross_bps,
-        funding_cost_bps=funding_cost_bps,
+        funding_cost_bps=effective_funding_bps,
         fee_cost_bps=fee_usd / buy_usd * 1e4,
         extra_cost_bps=extra_cost_bps,
         expected_net_edge_bps=expected_profit / buy_usd * 1e4,
@@ -184,6 +234,9 @@ def find_max_executable_size(
         safety_buffer_bps: float = 0.0,
         expected_latency_cost_bps: float = 0.0,
         funding_cost_bps: float = 0.0,
+        buy_funding_rate: Optional[float] = None,
+        sell_funding_rate: Optional[float] = None,
+        expected_holding_hours: float = 0.0,
         stablecoin_basis_cost_bps: float = 0.0,
         buy_quote_usd: float = 1.0,
         sell_quote_usd: float = 1.0,
@@ -195,27 +248,52 @@ def find_max_executable_size(
     non-increasing as quantity grows, making the feasibility predicate
     monotonic.
     """
-    asks = sorted(((px, size) for px, size in asks if px > 0 and size > 0),
-                  key=lambda level: level[0])
-    bids = sorted(((px, size) for px, size in bids if px > 0 and size > 0),
-                  key=lambda level: level[0], reverse=True)
+    asks = _clean_levels(asks, reverse=False)
+    bids = _clean_levels(bids, reverse=True)
     if not asks or not bids:
         return None, "empty_book"
-    if size_step <= 0:
-        raise ValueError("size_step must be > 0")
+    numeric = (
+        min_order_usd, max_order_usd, min_base, size_step,
+        required_net_edge_bps, max_vwap_slippage_bps,
+        max_book_impact_bps, buy_fee_bps, sell_fee_bps,
+        safety_buffer_bps, expected_latency_cost_bps,
+        funding_cost_bps, stablecoin_basis_cost_bps,
+        expected_holding_hours)
+    if not all(math.isfinite(float(value)) for value in numeric):
+        raise ValueError("all sizing inputs must be finite")
+    if size_step <= 0 or min_base < 0:
+        raise ValueError("size_step must be > 0 and min_base >= 0")
+    if min_order_usd <= 0 or max_order_usd < min_order_usd:
+        raise ValueError("USD order bounds are invalid")
+    if (buy_fee_bps < 0 or buy_fee_bps >= 10000
+            or sell_fee_bps < 0 or sell_fee_bps >= 10000):
+        raise ValueError("fee bps must be in [0, 10000)")
+    if (max_vwap_slippage_bps < 0 or max_book_impact_bps < 0
+            or safety_buffer_bps < 0 or expected_latency_cost_bps < 0):
+        raise ValueError("sizing limits and explicit buffers must be >= 0")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be > 0")
+    if max_base is not None and (not math.isfinite(float(max_base))
+                                 or max_base < 0):
+        raise ValueError("max_base must be finite and >= 0")
+    if not (math.isfinite(buy_quote_usd) and buy_quote_usd > 0
+            and math.isfinite(sell_quote_usd) and sell_quote_usd > 0):
+        raise ValueError("quote USD rates must be finite and > 0")
 
     depth_upper = min(sum(size for _, size in asks),
                       sum(size for _, size in bids))
     upper_candidates = [
         depth_upper,
-        _qty_within_notional(asks, max_order_usd),
-        _qty_within_notional(bids, max_order_usd),
+        _qty_within_notional(asks, max_order_usd / buy_quote_usd),
+        _qty_within_notional(bids, max_order_usd / sell_quote_usd),
     ]
     if max_base is not None:
         upper_candidates.append(max(float(max_base), 0.0))
     upper = _floor_step(min(upper_candidates), size_step)
-    buy_min_qty = _qty_to_reach_notional(asks, min_order_usd)
-    sell_min_qty = _qty_to_reach_notional(bids, min_order_usd)
+    buy_min_qty = _qty_to_reach_notional(
+        asks, min_order_usd / buy_quote_usd)
+    sell_min_qty = _qty_to_reach_notional(
+        bids, min_order_usd / sell_quote_usd)
     if buy_min_qty is None or sell_min_qty is None:
         return None, "insufficient_depth"
     minimum_qty = max(min_base, buy_min_qty, sell_min_qty)
@@ -228,6 +306,9 @@ def find_max_executable_size(
         safety_buffer_bps=safety_buffer_bps,
         expected_latency_cost_bps=expected_latency_cost_bps,
         funding_cost_bps=funding_cost_bps,
+        buy_funding_rate=buy_funding_rate,
+        sell_funding_rate=sell_funding_rate,
+        expected_holding_hours=expected_holding_hours,
         stablecoin_basis_cost_bps=stablecoin_basis_cost_bps,
         buy_quote_usd=buy_quote_usd,
         sell_quote_usd=sell_quote_usd,
@@ -237,11 +318,13 @@ def find_max_executable_size(
         edge = executable_edge(asks, bids, qty, **edge_kwargs)
         if edge is None:
             return None, "insufficient_depth"
-        if (edge.buy.notional_usd < min_order_usd
-                or edge.sell.notional_usd < min_order_usd):
+        buy_notional_usd = edge.buy.notional_usd * buy_quote_usd
+        sell_notional_usd = edge.sell.notional_usd * sell_quote_usd
+        if (buy_notional_usd < min_order_usd
+                or sell_notional_usd < min_order_usd):
             return None, "below_min_notional"
-        if (edge.buy.notional_usd > max_order_usd + 1e-8
-                or edge.sell.notional_usd > max_order_usd + 1e-8):
+        if (buy_notional_usd > max_order_usd + 1e-8
+                or sell_notional_usd > max_order_usd + 1e-8):
             return None, "above_max_notional"
         if edge.max_vwap_slippage_bps > max_vwap_slippage_bps + 1e-9:
             return None, "vwap_slippage"

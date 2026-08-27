@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -170,6 +171,8 @@ class PairPosition:
     def add(self, direction: PairDirection, qty: float, *,
             pair_id: Optional[str] = None, at: Optional[float] = None) -> None:
         qty = float(qty)
+        if not math.isfinite(qty):
+            raise ValueError("pair quantity must be finite")
         if qty <= 0:
             return
         direction = PairDirection(direction)
@@ -183,9 +186,12 @@ class PairPosition:
         self.base_qty += qty
 
     def reduce(self, qty: float) -> float:
+        qty = float(qty)
+        if not math.isfinite(qty):
+            raise ValueError("pair quantity must be finite")
         if not self.is_open or qty <= 0:
             return 0.0
-        reduced = min(float(qty), self.base_qty)
+        reduced = min(qty, self.base_qty)
         self.base_qty -= reduced
         if self.base_qty <= 1e-12:
             self.pair_id = None
@@ -196,6 +202,9 @@ class PairPosition:
 
     def sync(self, direction: Optional[PairDirection], qty: float, *,
              pair_id: Optional[str] = None, at: Optional[float] = None) -> None:
+        qty = float(qty)
+        if not math.isfinite(qty):
+            raise ValueError("pair quantity must be finite")
         self.pair_id = None
         self.direction = None
         self.base_qty = 0.0
