@@ -42,8 +42,13 @@ _ZH = {
     " RECORD-ONLY ": " 仅采集 ",
     " HALTED ": " 已停机 ",
     " VENUE DOWN ": " 交易所故障 ",
+    " KILL PAUSE ": " 风控暂停 ",
     " {n} STALE ": " {n} 路行情超时 ",
     " RATE-LTD ": " 限频中 ",
+    " WARMUP ": " 预热中 ",
+    " REGIME PAUSE ": " 状态暂停 ",
+    " COST PAUSE ": " 成本数据暂停 ",
+    " SESSION PAUSE ": " 时段暂停 ",
     " RECORDING ": " 采集中 ",
     " RUNNING ": " 运行中 ",
     "  up {t}": "  运行 {t}",
@@ -53,6 +58,7 @@ _ZH = {
     "bid / ask": "买一 / 卖一",
     "spr bps": "点差 bps",
     "age": "数据龄",
+    "x-lag": "所内延迟",
     "position": "持仓",
     "volume": "成交额",
     "equity": "权益",
@@ -60,6 +66,7 @@ _ZH = {
     " DOWN": " 故障",
     " LTD": " 限频",
     "STALE": "超时",
+    "DISCONNECTED": "已断开",
     "session": "会话",
     "PnL (MTM)": "盈亏 (MTM)",
     "account Δ": "账户权益变动",
@@ -70,6 +77,11 @@ _ZH = {
     "net delta": "净敞口",
     "errors": "连续错误",
     "last exec": "上次执行",
+    "exec state": "执行状态",
+    "risk event": "风险事件",
+    "Pair net PnL": "Pair 净盈亏",
+    "cost inputs": "成本输入",
+    "market session": "市场时段",
     "minute rows": "分钟数据行数",
     "{s}s ago": "{s} 秒前",
     "signal — executable premium vs full hurdle incl. fees (● = armed)":
@@ -77,6 +89,11 @@ _ZH = {
     "mid premium ": "中间价溢价 ",
     "   midline ": "   中枢 ",
     "   band ": "   区间 ",
+    "   Z signal ": "   Z 信号 ",
+    "   sizing ": "   仓位 ",
+    "   dynamic ": "   动态 ",
+    "VWAP auto": "VWAP 自动",
+    "legacy depth": "旧版深度",
     "SELL entropy → buy {h}": "卖出 entropy → 买入 {h}",
     "BUY entropy → sell {h}": "买入 entropy → 卖出 {h}",
     "direction": "方向",
@@ -88,11 +105,19 @@ _ZH = {
     "qty": "数量",
     "notional": "名义金额",
     "prem bps": "溢价 bps",
+    "mode": "模式",
+    "action": "动作",
+    "Z": "Z",
     "expected $": "预期 $",
     "actual $": "实际 $",
     "status": "状态",
     "Σ last {n}": "Σ 最近 {n} 笔",
     "no executions yet": "暂无执行",
+    "latency (rolling local observations)": "延迟（本地滚动观测）",
+    "metric": "指标",
+    "samples": "样本",
+    "max": "最大",
+    "no latency samples yet": "暂无延迟样本",
     "events (full log: {f})": "日志事件（完整日志：{f}）",
     "entropy-arb stopped": "entropy-arb 已停止",
     " — {t} trades / {h} hedges, session PnL ": " —— 执行 {t} / 对冲 {h}，会话盈亏 ",
@@ -129,6 +154,14 @@ def _usd(x: Optional[float], signed: bool = True, decimals: int = 4) -> Text:
     if signed:
         return Text(f"${x:+,.{decimals}f}", style=style)
     return Text(f"${x:,.{decimals}f}")
+
+
+def _duration_ms(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    if value < 1000.0:
+        return f"{value:.0f}ms"
+    return f"{value / 1000.0:.1f}s"
 
 
 class Dashboard:
@@ -194,7 +227,8 @@ class Dashboard:
         else:
             mid = Group(self._venues_panel(), self._session_panel())
         return Group(self._header(), mid, self._signal_panel(),
-                     self._trades_panel(), self._events_panel())
+                     self._latency_panel(), self._trades_panel(),
+                     self._events_panel())
 
     def _header(self):
         eng, cfg = self.eng, self.eng.cfg
@@ -203,12 +237,23 @@ class Dashboard:
             if eng.record_only \
             else Text(self._t(" LIVE "), style="white on dark_green")
         stale = sum(1 for v in eng.venues.values()
-                    if not v.book.is_fresh(cfg.staleness_sec))
+                    if not eng._book_quality(v).ok)
         limited = sum(1 for v in eng.venues.values() if eng._venue_limited(v))
+        pause_reason = eng.strategy_pause_reason()
         if eng.halted:
             state = Text(self._t(" HALTED "), style="bold white on red")
+        elif (pause_reason or "").startswith("kill:"):
+            state = Text(self._t(" KILL PAUSE "), style="bold white on red")
         elif eng._venue_down:
             state = Text(self._t(" VENUE DOWN "), style="bold white on red")
+        elif (pause_reason or "").startswith("regime:"):
+            state = Text(self._t(" REGIME PAUSE "), style="bold white on red")
+        elif (pause_reason or "").startswith("cost:"):
+            state = Text(self._t(" COST PAUSE "), style="bold white on red")
+        elif (pause_reason or "").startswith("session:"):
+            state = Text(self._t(" SESSION PAUSE "), style="black on yellow")
+        elif pause_reason in ("dynamic_warmup", "regime_warmup"):
+            state = Text(self._t(" WARMUP "), style="black on yellow")
         elif stale:
             state = Text(self._t(" {n} STALE ", n=stale),
                          style="black on yellow")
@@ -241,22 +286,25 @@ class Dashboard:
         t = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
         for col, j in (("venue", "left"), ("bid / ask", "right"),
                        ("spr bps", "right"), ("age", "right"),
+                       ("x-lag", "right"),
                        ("position", "right"), ("volume", "right"),
                        ("equity", "right"), ("free", "right")):
             t.add_column(self._t(col), justify=j, no_wrap=True)
         vol_total = 0.0
         for v in eng.venues.values():
             bb, ba, m = v.book.best_bid(), v.book.best_ask(), v.book.mid()
-            fresh = v.book.is_fresh(cfg.staleness_sec)
+            quality = eng._book_quality(v, now)
+            fresh = quality.ok
             name = Text(v.name, style="bold")
             if v.key in eng._venue_down:
                 name.append(self._t(" DOWN"), style="bold white on red")
             elif eng._venue_limited(v):
                 name.append(self._t(" LTD"), style="bold yellow")
-            age = (Text(f"{now - v.book.last_update_ts:.1f}s", style="dim")
-                   if v.book.ready else Text("—", style="dim"))
+            age = Text(_duration_ms(quality.book_age_ms), style="dim")
             if not fresh:
-                age = Text(self._t("STALE"), style="bold red")
+                label = ("DISCONNECTED" if quality.reason == "disconnected"
+                         else "STALE")
+                age = Text(self._t(label), style="bold red")
             pos = Text(f"{v.position:+.6g}",
                        style="green" if v.position > 0
                        else ("red" if v.position < 0 else "dim"))
@@ -267,7 +315,7 @@ class Dashboard:
             t.add_row(name,
                       f"{bb:,.6g} / {ba:,.6g}" if (bb and ba) else "—",
                       f"{(ba / bb - 1) * 1e4:.1f}" if (bb and ba) else "—",
-                      age, pos,
+                      age, _duration_ms(quality.exchange_lag_ms), pos,
                       Text(f"${vol:,.0f}") if vol else Text("—", style="dim"),
                       _usd(v.equity, signed=False, decimals=2),
                       _usd(v.free, signed=False, decimals=2))
@@ -300,6 +348,47 @@ class Dashboard:
         g.add_row(self._t("errors"), Text(str(eng.consec_errors),
                   style="bold red" if eng.consec_errors else "dim"))
         g.add_row(self._t("last exec"), Text(last, style="dim"))
+        market_session = eng._activate_market_session()
+        session_text = market_session.session.value
+        if eng.cfg.session.enabled:
+            session_text += " · " + market_session.local_time.strftime(
+                "%Y-%m-%d %H:%M ET")
+        g.add_row(self._t("market session"), Text(
+            session_text,
+            style="green" if market_session.entry_allowed else "yellow"))
+        if eng.execution_history:
+            latest = eng.execution_history[-1]
+            g.add_row(self._t("exec state"), Text(
+                f"{latest.pair_id} · {latest.state.value}",
+                style="bold cyan" if latest.state.value not in
+                ("COMPLETE", "FAILED") else "dim"))
+        if eng.risk_events:
+            risk = eng.risk_events[-1]
+            g.add_row(self._t("risk event"), Text(
+                f"{risk.action.value} · {risk.trigger}", style="bold red"))
+        if eng.ledger is not None:
+            pair_pnl = (eng.ledger.current or
+                        (eng.ledger.completed[-1]
+                         if eng.ledger.completed else None))
+            if pair_pnl is not None:
+                suffix = "open" if not pair_pnl.complete else "complete"
+                g.add_row(self._t("Pair net PnL"), Text(
+                    f"${pair_pnl.net_pnl:+.4f} · {suffix} · "
+                    f"funding ${pair_pnl.funding:+.4f}",
+                    style="green" if pair_pnl.net_pnl >= 0 else "red"))
+        if eng.cfg.funding.enabled or eng.cfg.stablecoin.enabled:
+            cost_pause = eng.costs.pause_reason()
+            warnings = eng.costs.warning_assets()
+            cost_text = (cost_pause or
+                         ("warning:" + ",".join(warnings) if warnings else "fresh"))
+            g.add_row(self._t("cost inputs"), Text(
+                cost_text, style="bold red" if cost_pause else
+                "yellow" if warnings else "green"))
+        pair = eng.pair_position
+        if pair.is_open:
+            g.add_row("Pair", Text(
+                f"{pair.direction.value} {pair.base_qty:.6g}",
+                style="bold cyan"))
         if eng.recorder is not None:
             g.add_row(self._t("minute rows"),
                       Text(str(eng.recorder.rows_written), style="dim"))
@@ -307,13 +396,15 @@ class Dashboard:
                      padding=(0, 1))
 
     def _dir_row(self, t: Table, label: str, buy, sell, hurdle_bps: float,
-                 armed_key: str) -> None:
+                 armed_key: str, *, include_inventory: bool = True,
+                 extra_cost_bps: float = 0.0) -> None:
         """One direction: executable premium vs its full hurdle (fees and
         inventory surcharge included)."""
         eng = self.eng
         ba, sb = buy.book.best_ask(), sell.book.best_bid()
-        hurdle = (hurdle_bps + buy.fee_bps + sell.fee_bps
-                  + eng._inv_add_bps(buy, sell))
+        hurdle = (hurdle_bps + buy.fee_bps + sell.fee_bps + extra_cost_bps
+                  + (eng._inv_add_bps(buy, sell)
+                     if include_inventory else 0.0))
         if not (ba and sb):
             t.add_row(label, Text("—", style="dim"),
                       f"{hurdle:+.1f}", Text("—", style="dim"), "")
@@ -330,30 +421,118 @@ class Dashboard:
     def _signal_panel(self):
         eng, cfg = self.eng, self.eng.cfg
         prem = eng.premium_bps()
+        active_midline = eng.active_midline_bps()
         head = Text()
         head.append(self._t("mid premium "), style="dim")
         head.append(f"{prem:+.2f} bps" if prem is not None else "—",
                     style="bold cyan")
         head.append(self._t("   midline "), style="dim")
-        head.append(f"{cfg.midline_bps:+.2f}")
-        head.append(self._t("   band "), style="dim")
-        head.append(f"[{cfg.midline_bps - cfg.lower_bps:+.2f} … "
-                    f"{cfg.midline_bps + cfg.upper_bps:+.2f}]")
+        head.append(f"{active_midline:+.2f}")
+        if cfg.midline.mode == "dynamic":
+            head.append(self._t("   Z signal "), style="dim")
+            head.append(f"entry ±{cfg.midline.entry_z_score:.2f} · "
+                        f"exit ±{cfg.midline.exit_z_score:.2f}")
+        else:
+            head.append(self._t("   band "), style="dim")
+            head.append(f"[{active_midline - cfg.lower_bps:+.2f} … "
+                        f"{active_midline + cfg.upper_bps:+.2f}]")
+        head.append(self._t("   sizing "), style="dim")
+        if cfg.vwap_sizing.enabled:
+            head.append(self._t("VWAP auto"), style="bold green")
+            head.append(f" (min dev {cfg.vwap_sizing.minimum_net_edge_bps:.1f}"
+                        f" / buffer {cfg.vwap_sizing.safety_buffer_bps:.1f} bps)",
+                        style="dim")
+        else:
+            head.append(self._t("legacy depth"), style="yellow")
+        dynamic = Text()
+        if cfg.midline.mode == "dynamic" or cfg.regime.enabled:
+            dynamic.append(self._t("   dynamic "), style="dim")
+            stats = eng.spread_stats
+            if stats is None:
+                dynamic.append("warmup 0/" + str(cfg.midline.min_samples),
+                               style="yellow")
+            else:
+                dynamic.append(
+                    f"fast {stats.fast_midline_bps:+.2f} · "
+                    f"slow {stats.slow_midline_bps:+.2f} · "
+                    f"vol {stats.volatility_bps:.2f} · Z {stats.z_score:+.2f} "
+                    f"· n {stats.sample_count}/{cfg.midline.min_samples}",
+                    style="green" if stats.ready else "yellow")
+                pause = eng.strategy_pause_reason()
+                if pause:
+                    dynamic.append(f" · {pause}", style="bold red")
         t = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
         t.add_column(self._t("direction"))
         t.add_column(self._t("exec prem bps"), justify="right")
         t.add_column(self._t("hurdle bps"), justify="right")
         t.add_column(self._t("gap bps"), justify="right")
         t.add_column("", justify="left")
-        self._dir_row(t, self._t("SELL entropy → buy {h}", h=eng.hedge.name),
-                      eng.hedge, eng.entropy,
-                      cfg.midline_bps + cfg.upper_bps, "sell_entropy")
-        self._dir_row(t, self._t("BUY entropy → sell {h}", h=eng.hedge.name),
-                      eng.entropy, eng.hedge,
-                      cfg.lower_bps - cfg.midline_bps, "buy_entropy")
-        return Panel(Group(head, t),
+        sell_hurdle = active_midline + cfg.upper_bps
+        buy_hurdle = cfg.lower_bps - active_midline
+        sell_label = self._t("SELL entropy → buy {h}", h=eng.hedge.name)
+        buy_label = self._t("BUY entropy → sell {h}", h=eng.hedge.name)
+        include_inventory = True
+        extra_cost = 0.0
+        if cfg.midline.mode == "dynamic" and eng.spread_stats is not None:
+            stats = eng.spread_stats
+            include_inventory = False
+            extra_cost = (cfg.vwap_sizing.safety_buffer_bps
+                          + cfg.vwap_sizing.expected_latency_cost_bps
+                          if cfg.vwap_sizing.enabled else 0.0)
+            sell_action = eng._signal_action("sell_entropy")
+            buy_action = eng._signal_action("buy_entropy")
+
+            def dynamic_hurdle(action, is_sell_entropy, buy, sell):
+                if action.value == "EXIT":
+                    return (stats.slow_midline_bps
+                            - cfg.midline.exit_z_score * stats.volatility_bps
+                            if is_sell_entropy else
+                            -stats.slow_midline_bps
+                            - cfg.midline.exit_z_score * stats.volatility_bps)
+                deviation = max(
+                    cfg.midline.entry_z_score * stats.volatility_bps
+                    + eng._inv_add_bps(buy, sell),
+                    cfg.vwap_sizing.minimum_net_edge_bps
+                    if cfg.vwap_sizing.enabled else 0.0)
+                return ((stats.slow_midline_bps if is_sell_entropy
+                         else -stats.slow_midline_bps) + deviation)
+
+            sell_hurdle = dynamic_hurdle(
+                sell_action, True, eng.hedge, eng.entropy)
+            buy_hurdle = dynamic_hurdle(
+                buy_action, False, eng.entropy, eng.hedge)
+            sell_label += f" [{sell_action.value}]"
+            buy_label += f" [{buy_action.value}]"
+        self._dir_row(t, sell_label,
+                      eng.hedge, eng.entropy, sell_hurdle, "sell_entropy",
+                      include_inventory=include_inventory,
+                      extra_cost_bps=extra_cost)
+        self._dir_row(t, buy_label, eng.entropy, eng.hedge,
+                      buy_hurdle, "buy_entropy",
+                      include_inventory=include_inventory,
+                      extra_cost_bps=extra_cost)
+        return Panel(Group(head, dynamic, t),
                      title=self._t("signal — executable premium vs full "
                                    "hurdle incl. fees (● = armed)"),
+                     box=box.ROUNDED, padding=(0, 1))
+
+    def _latency_panel(self):
+        snapshot = self.eng.latency.snapshot()
+        t = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
+        t.add_column(self._t("metric"))
+        t.add_column(self._t("samples"), justify="right")
+        t.add_column("P50 ms", justify="right")
+        t.add_column("P95 ms", justify="right")
+        t.add_column("P99 ms", justify="right")
+        t.add_column(self._t("max"), justify="right")
+        if not snapshot:
+            t.add_row(Text(self._t("no latency samples yet"), style="dim"),
+                      "", "", "", "", "")
+        for name, summary in snapshot.items():
+            t.add_row(name, str(summary.count), f"{summary.p50_ms:.2f}",
+                      f"{summary.p95_ms:.2f}", f"{summary.p99_ms:.2f}",
+                      f"{summary.max_ms:.2f}")
+        return Panel(t, title=self._t("latency (rolling local observations)"),
                      box=box.ROUNDED, padding=(0, 1))
 
     def _trades_panel(self):
@@ -370,6 +549,9 @@ class Dashboard:
         t.add_column(self._t("qty"), justify="right")
         t.add_column(self._t("notional"), justify="right")
         t.add_column(self._t("prem bps"), justify="right")
+        t.add_column(self._t("mode"))
+        t.add_column(self._t("action"))
+        t.add_column(self._t("Z"), justify="right")
         t.add_column(self._t("expected $"), justify="right", footer=_usd(exp_sum))
         t.add_column(self._t("actual $"), justify="right",
                      footer=_usd(sum(fills) if fills else None))
@@ -379,11 +561,15 @@ class Dashboard:
             t.add_row(time.strftime("%H:%M:%S", time.localtime(r["ts"])),
                       r["direction"], f"{r['qty']:.6g}",
                       f"${r['notional']:,.0f}", f"{r['prem_bps']:+.1f}",
+                      r.get("sizing_mode", "legacy"),
+                      r.get("signal_action", "OPEN"),
+                      ("—" if r.get("z_score") is None else
+                       f"{r['z_score']:+.2f}"),
                       _usd(r["exp"]), _usd(r["fill"]),
                       Text(r["status"], style=style))
         if not rows:
             t.add_row(Text(self._t("no executions yet"), style="dim"),
-                      "", "", "", "", "", "", "")
+                      "", "", "", "", "", "", "", "", "", "")
         return Panel(t, title=self._t("last {n} executions (net of fees)",
                                       n=TRADE_ROWS),
                      box=box.ROUNDED, padding=(0, 1))

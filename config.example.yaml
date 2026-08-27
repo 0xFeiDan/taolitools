@@ -22,8 +22,11 @@
 # ============================ THE SIGNAL / 信号 ============================
 # premium_bps = (Entropy price / hedge price - 1) * 10000
 #
+# Static only / 仅 Static 模式：
 #   SELL entropy + BUY hedge   when executable premium >= midline + upper
 #   BUY entropy + SELL hedge   when executable premium <= midline - lower
+# Dynamic mode uses entry_z_score / exit_z_score below and ignores upper/lower.
+# Dynamic 模式使用下方 entry_z_score / exit_z_score，忽略 upper/lower。
 #
 # Both hurdles are net of taker fees (the engine adds fees on top), so one
 # full round trip nets >= upper + lower bps after fees by construction.
@@ -40,14 +43,64 @@ thresholds:
   upper_bps: 4.0       # entry above midline: sell entropy / 中枢上方入场带宽
   lower_bps: 4.0       # entry below midline: buy entropy / 中枢下方入场带宽
 
+# V2 features land in phases. Any switch whose engine phase is still pending
+# fails closed at startup. The enabled V2 modules below are active.
+# V2 功能分阶段接入。尚未接入引擎的开关会在启动时 fail-closed；下方已开启
+# 的 V2 模块均已接入运行时。
+#
+# Dynamic uses the slow rolling median as its trading baseline. The static
+# value above is display-only during warm-up; new entries stay paused until
+# min_samples is reached. Fast EMA is only a regime signal, never the baseline.
+# dynamic 使用慢速滚动中位数作为交易中枢。预热期上方静态值只用于显示，达到
+# min_samples 前禁止新增交易。Fast EMA 只用于 regime 检测，不作为交易基准。
+midline:
+  mode: dynamic                # static | dynamic
+  fast_method: ema             # short estimator / 快线
+  fast_window_seconds: 300
+  slow_method: median          # robust trading baseline / 稳健慢线
+  slow_window_seconds: 1800
+  min_samples: 300
+  volatility_method: std       # std | mad
+  volatility_window_seconds: 1800
+  volatility_floor_bps: 0.1    # prevents division by zero / 防止零波动除法
+  entry_z_score: 2.5           # OPEN/ADD at +entry or -entry / 开仓或加仓
+  exit_z_score: 0.5            # EXIT inside return-to-center zone / 回归后退出
+
+# Opt-in V2 regime guard. It will pause new entries, never silently flatten.
+# V2 市场状态保护开关：触发时只暂停新增仓位，不会静默强平。
+regime:
+  enabled: true
+  max_fast_slow_difference_bps: 8.0
+  max_z_score: 5.0
+  max_absolute_spread_bps: 50.0
+  break_persist_seconds: 1.0
+  recovery_persist_seconds: 30.0
+
+# Millisecond book-age guard; the legacy connection staleness check
+# remains under execution.staleness_sec for backward compatibility.
+# 毫秒级盘口年龄保护；旧版连接存活检查仍保留在 execution.staleness_sec。
+market_data:
+  enforce_book_age: true
+  max_book_age_ms: 300
+
+# One switch only / 只需一个开关：
+# false = crypto 24/7; true = US stock perpetual, OPEN/ADD only in regular RTH.
+# false = 虚拟货币 24/7；true = 股票永续，仅美股正常交易时段允许开仓/加仓。
+session:
+  enabled: false
+
 # ======================== VENUES / 交易所参数 ==============================
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
+  quote_asset: USDC          # collateral/price denomination / 计价资产
   taker_fee_bps: 0.0         # taker fee / 吃单手续费
   max_position_usd: 1000     # position cap / 持仓上限（美元）
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
+  # lighter-rh normally uses USDG; lighter/tradexyz normally use USDC.
+  # The CLI selection supplies that default; only override for a known change.
+  # 程序会根据 --hedge 自动选择默认值；只有交易所规则变化时才手动覆盖 quote_asset。
   taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
   max_position_usd: 1000
   max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
@@ -57,6 +110,20 @@ sizing:
   take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
   max_order_notional_usd: 500  # per-slice cap / 单笔名义上限
   min_order_notional_usd: 10   # skip dust / 低于此名义不下单
+  # V2 current-orderbook VWAP sizing. This walks live depth, not candle VWAP.
+  # V2 当前盘口 VWAP 自动仓位：逐档模拟实时深度，不是 K 线 VWAP。
+  # Disable to retain the legacy take_fraction + max_order_notional path.
+  # 关闭后继续使用旧版 take_fraction + max_order_notional 逻辑。
+  vwap_enabled: true
+  min_order_usd: 1000
+  max_order_usd: 50000
+  # Minimum deviation from the active directional midline after modeled costs.
+  # 扣除建模成本后，相对当前有效中枢的最小方向偏离。
+  minimum_net_edge_bps: 6.0
+  max_vwap_slippage_bps: 5.0
+  max_book_impact_bps: 5.0
+  safety_buffer_bps: 2.0
+  expected_latency_cost_bps: 0.0  # set from observed P95/P99 / 根据实测延迟填写
 
 # ==================== INVENTORY LADDER / 库存阶梯 ==========================
 # Extra bps required once a venue's position passes floor_frac of its cap in
@@ -82,6 +149,54 @@ execution:
   reconcile_sec: 15.0          # on-chain position sync cadence / 链上持仓核对周期
   venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
   http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+  # V2 one-leg recovery. On timeout, a confirmed OPEN/ADD leg is immediately
+  # unwound reduce-only; unresolved/EXIT outcomes are reconciled then hedged.
+  # V2 单腿恢复：超时后立即 reduce-only 撤销已确认的 OPEN/ADD 单腿；
+  # 未知结果和 EXIT 等待确认后再对账、恢复 Delta Neutral。
+  risk_recovery_enabled: true
+  hedge_timeout_ms: 250
+  max_unhedged_delta_usd: 5000
+
+# V2 unified kill-switch contract. Emergency flatten stays separately gated
+# because it sends real reduce-only orders and must never be enabled implicitly.
+# V2 统一熔断配置。紧急平仓会发送真实 reduce-only 订单，因此必须单独显式开启。
+kill_switch:
+  enabled: true
+  max_unhedged_duration_ms: 1000
+  max_consecutive_partial_fills: 3
+  max_reconcile_mismatch_usd: 1000
+  max_session_loss_usd: 0       # 0 = disabled / 0 表示不按会话亏损触发
+  emergency_flatten_enabled: false
+  emergency_flatten_retry_sec: 2
+  emergency_flatten_max_attempts: 0  # 0 = retry until flat / 0 = 持续重试直到平仓
+
+# Append-only audit events plus an atomic restart snapshot. These files contain
+# trading/accounting data but no credentials.
+# 追加式审计事件 + 原子重启快照；包含交易数据，但不包含密钥。
+accounting:
+  enabled: true
+  ledger_jsonl: logs/pair-ledger.jsonl
+  state_json: logs/runtime-state.json
+
+# Current rates are fetched from each venue. Positive funding means longs pay.
+# Enabled-but-stale data blocks OPEN/ADD rather than silently using zero.
+# 当前费率从两边交易所读取；正资金费表示多头支付。启用后数据缺失/过期会禁止开仓。
+funding:
+  enabled: true
+  expected_holding_hours: 1
+  refresh_seconds: 60
+  max_age_seconds: 180
+
+# Quote assets are normalized to USD with Coinbase Exchange level-1 books.
+# A missing source fails closed; a severe depeg pauses OPEN/ADD.
+# 使用 Coinbase Exchange 一档盘口将计价资产换算为 USD；数据缺失或严重脱锚会暂停开仓。
+stablecoin:
+  enabled: true
+  source_url: https://api.exchange.coinbase.com
+  refresh_seconds: 30
+  max_age_seconds: 90
+  warning_deviation_bps: 10
+  halt_deviation_bps: 30
 
 # ================== DATA RECORDER / 数据采集 ===============================
 # Always-on while the bot runs: samples both real order books 1/sec and

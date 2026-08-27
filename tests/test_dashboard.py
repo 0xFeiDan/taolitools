@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -15,6 +17,12 @@ from entropy_arb.book import OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.dashboard import BufferLogHandler, Dashboard  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
+from entropy_arb.midline import (  # noqa: E402
+    RegimeDetector,
+    SpreadStats,
+)
+from entropy_arb.models import RiskAction  # noqa: E402
+from entropy_arb.session import MarketSession, SessionStatus  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
@@ -50,7 +58,14 @@ class StubVenue:
 
 def render(eng, lang="en") -> str:
     dash = Dashboard(eng, BufferLogHandler(), "logs/engine.log", lang=lang)
-    console = Console(record=True, width=120, force_terminal=True)
+    # Wide enough to assert full cell values rather than Rich's intentional
+    # ellipsis behavior at normal interactive widths.
+    console = Console(record=True, width=180, force_terminal=True,
+                      _environ={})
+    # Render and capture against the same width.  Otherwise Dashboard uses its
+    # own non-TTY fallback width (usually 80) and Rich legitimately truncates
+    # values before the capture console sees them.
+    dash.console = console
     console.print(dash._safe_render())
     return console.export_text()
 
@@ -81,6 +96,7 @@ def test_renders_key_numbers():
     eng.entropy.equity, eng.entropy.start_equity = 1000.0, 990.0
     eng.hedge.equity, eng.hedge.start_equity = 500.0, 500.0
     eng.trades, eng.hedges = 7, 1
+    eng.latency.extend("market_to_signal_ms", [1.0, 2.0, 3.0])
     eng.recent_trades.append({
         "ts": time.time(), "direction": "sell_entropy", "qty": 0.5,
         "notional": 50.0, "prem_bps": 15.0, "exp": 0.07, "fill": 0.05,
@@ -89,7 +105,8 @@ def test_renders_key_numbers():
     for needle in ("ENTROPY", "RH", "SELL entropy", "BUY entropy",
                    "100.14", "99.99", "mid premium", "midline",
                    "7 / 1", "sell_entropy", "filled/filled",
-                   "$+10.00", "LIVE", "s ago"):
+                   "$+10.00", "LIVE", "s ago", "market_to_signal_ms",
+                   "P95 ms"):
         assert needle in out, f"{needle!r} missing from render"
     assert "render error" not in out
     # signal math: sell hurdle = midline+upper = +6 (zero fees, flat books)
@@ -115,6 +132,77 @@ def test_renders_in_chinese():
     # English render untouched by the zh table
     out_en = render(eng, lang="en")
     assert "session" in out_en and "会话" not in out_en
+
+
+def test_renders_dynamic_stats_and_regime_pause():
+    eng = make_engine()
+    eng.entropy.set_book(100.60, 100.62)
+    eng.hedge.set_book(99.99, 100.01)
+    eng.cfg.midline = replace(eng.cfg.midline, mode="dynamic", min_samples=1)
+    eng.cfg.regime = replace(
+        eng.cfg.regime, enabled=True, break_persist_seconds=0.0,
+        max_absolute_spread_bps=50.0)
+    eng.spread_stats = SpreadStats(
+        timestamp=time.time(), spread_bps=61.0,
+        fast_midline_bps=20.0, slow_midline_bps=5.0,
+        volatility_bps=10.0, deviation_bps=56.0, z_score=5.6,
+        sample_count=10, window_span_seconds=9.0, ready=True)
+    eng.regime_detector = RegimeDetector(
+        max_fast_slow_difference_bps=8.0, max_z_score=5.0,
+        max_absolute_spread_bps=50.0, break_persist_seconds=0.0,
+        recovery_persist_seconds=30.0)
+    eng.regime_detector.update(eng.spread_stats)
+
+    out = render(eng)
+    for needle in ("REGIME PAUSE", "fast +20.00", "slow +5.00",
+                   "vol 10.00", "Z +5.60", "regime:"):
+        assert needle in out
+
+
+def test_renders_kill_pause_and_latest_risk_event():
+    eng = make_engine()
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng._risk_event(
+        "test_limit", RiskAction.PAUSE_NEW_ENTRY,
+        "test persistent limit", persistent=True)
+
+    out = render(eng)
+    assert "KILL PAUSE" in out
+    assert "risk event" in out
+    assert "PAUSE_NEW_ENTRY · test_limit" in out
+
+
+def test_renders_cost_pause_when_enabled_input_is_missing():
+    eng = make_engine()
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.cfg.funding = replace(eng.cfg.funding, enabled=True)
+    eng.costs.funding_enabled = True
+
+    out = render(eng)
+    assert "COST PAUSE" in out
+    assert "cost inputs" in out
+    assert "funding_stale:" in out
+
+
+def test_renders_stock_session_pause_and_market_session():
+    eng = make_engine()
+    eng.entropy.set_book(99.9, 100.1)
+    eng.hedge.set_book(99.9, 100.1)
+    eng.cfg.session = replace(eng.cfg.session, enabled=True)
+    pre = SessionStatus(
+        MarketSession.PRE_MARKET, datetime.now(timezone.utc),
+        entry_allowed=False, sampleable=True)
+    eng.session_clock.status = lambda timestamp=None: pre
+
+    out = render(eng)
+    assert "SESSION PAUSE" in out
+    assert "market session" in out
+    assert "pre_market" in out
+
+    out_zh = render(eng, lang="zh")
+    assert "时段暂停" in out_zh and "市场时段" in out_zh
 
 
 def test_zh_stop_summary():

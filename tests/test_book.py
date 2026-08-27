@@ -91,6 +91,43 @@ def test_lighter_diff_maintenance():
     assert b.best_bid() == 98.9 and b.best_ask() == 100.2
 
 
+def test_book_quality_separates_heartbeat_from_book_age():
+    b = OrderBook()
+    b.apply_hl([[{"px": "100", "sz": "1"}],
+                [{"px": "101", "sz": "1"}]],
+               received_ts=100.0, exchange_ts=99.975)
+    quality = b.quality(1.0, max_book_age_ms=300.0, now=100.2)
+    assert quality.ok and quality.reason == "ok"
+    assert abs(quality.book_age_ms - 200.0) < 1e-9
+    assert abs(quality.exchange_lag_ms - 25.0) < 1e-9
+
+    # A heartbeat proves the socket is alive, but does not make an old book
+    # update fresh under the V2 millisecond guard.
+    b.touch(100.45)
+    quality = b.quality(1.0, max_book_age_ms=300.0, now=100.5)
+    assert not quality.ok and quality.reason == "book_stale"
+    assert quality.message_age_ms < 100.0
+
+    # Legacy mode still treats the same connected feed as fresh.
+    assert b.quality(1.0, now=100.5).ok
+
+
+def test_book_quality_connection_states_fail_closed():
+    b = OrderBook()
+    assert b.quality(1.0, now=100.0).reason == "disconnected"
+    b.mark_connecting()
+    assert b.quality(1.0, now=100.0).reason == "not_ready"
+    b.apply_lighter(
+        {"bids": [{"price": "100", "size": "1"}],
+         "asks": [{"price": "101", "size": "1"}]},
+        snapshot=True, received_ts=100.0)
+    assert b.quality(0.2, now=100.3).reason == "connection_stale"
+    b.mark_disconnected("test close")
+    quality = b.quality(1.0, now=100.3)
+    assert quality.reason == "disconnected"
+    assert b.last_disconnect_reason == "test close"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

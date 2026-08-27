@@ -25,13 +25,14 @@ websocket (`wss://api.hyperliquid.xyz/ws`), Lighter books from Lighter's
 official websocket.
 
 While it runs — even with no credentials and no strategy — it records both
-books to **1-minute CSV bars**, and the bundled analyzer turns that data into
-the three numbers that define the whole strategy.
+books to **1-minute CSV bars**, and the bundled analyzer provides the spread
+distribution used to configure either signal mode.
 
 ## The signal
 
-The band is three numbers in `config.yaml`, derived by you from recorded
-data:
+There are two compatible signal modes. **Static** uses the configured bps band
+shown below. **Dynamic** uses the rolling Slow Midline plus Z-score
+OPEN/ADD/EXIT rules described later.
 
 ```
 premium_bps = (Entropy price / hedge price − 1) × 10 000
@@ -45,18 +46,19 @@ midline − lower  ────────────────────�
                           └──────────────  BUY entropy + SELL hedge
 ```
 
-- `midline_bps` — where the premium normally sits. Cross-venue premiums are
+- `midline_bps` — the Static premium center and Dynamic warm-up display seed.
+  Cross-venue premiums are
   rarely centered at zero (different oracles, different quote assets, listing
   premia), so a zero-centered band would fire one direction only, cap out and
   never unwind. Measure where the premium actually sits and type it in.
-- `upper_bps` / `lower_bps` — the entry bands on each side of the midline.
+- `upper_bps` / `lower_bps` — Static-mode bands; Dynamic mode ignores them.
 
-Both hurdles are applied to **executable** prices (entropy bid vs hedge ask,
+In Static mode, both hurdles are applied to **executable** prices (entropy bid vs hedge ask,
 and vice versa) and are **net of both venues' taker fees** — the engine adds
 fees on top before a slice qualifies. A full round trip therefore nets
 **≥ upper + lower bps after fees by construction**.
 
-One consequence worth understanding: with `midline_bps: 5`, the buy-entropy
+One Static-mode consequence worth understanding: with `midline_bps: 5`, the buy-entropy
 hurdle is `lower − midline`, which can be **negative**. That is intentional —
 if entropy is persistently 5 bps rich, buying it at a 0 bps premium is 5 bps
 cheap versus its own equilibrium, and that trade is the profitable unwind of
@@ -74,6 +76,14 @@ pip install -r requirements.txt          # data collection needs only this
 
 cp config.example.yaml config.yaml       # the strategy (thresholds, sizing, risk)
 cp .env.example .env                     # credentials — required to trade
+```
+
+For local development and unit tests, install the development requirements;
+these do not include any live-trading signing SDK:
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest tests/
 ```
 
 The markets are **not** in the config file — you state them explicitly on
@@ -118,7 +128,7 @@ feeds are fresh and the band is crossed.
 books with age/spread, positions and caps, equity and session PnL, the
 executable premium of each direction against its full hurdle (fees and
 inventory surcharge included, ● = armed), recorder progress, the last
-executions, and a tail of the log (the full log goes to `logging.file`,
+executions, rolling latency P50/P95/P99, and a tail of the log (the full log goes to `logging.file`,
 default `logs/engine.log`). It works in `--record-only` too. Add `--cn` to
 display the dashboard in Chinese. Use `--no-dashboard` for plain console
 logs (nohup/systemd — off-terminal runs fall back automatically), or set
@@ -156,17 +166,186 @@ errors), credentials in `.env`, and the markets on the command line
 |---|---|---|
 | `thresholds.midline_bps` | premium center (measure it!) | — |
 | `thresholds.upper_bps` / `lower_bps` | entry bands (> 0) | — |
+| `midline.mode` | `static` or live `dynamic` slow-median baseline | `dynamic` in the example |
+| `midline.fast_window_seconds` / `slow_window_seconds` | Fast EMA / Slow rolling-median windows | 300 / 1800 |
+| `midline.min_samples` | fresh 1Hz samples required before dynamic trading | 300 |
+| `midline.volatility_method` | rolling `std` or robust scaled `mad` | `std` |
+| `midline.entry_z_score` / `exit_z_score` | Dynamic OPEN/ADD and EXIT thresholds | 2.5 / 0.5 |
+| `regime.enabled` | pause new entries on a confirmed regime break | `true` in the example |
 | `entropy.dex` | Entropy's dex name on Hyperliquid | `io` |
 | `*.taker_fee_bps` | per-venue taker fee | 0.0 (tradexyz hedge: 1.0) |
 | `*.max_position_usd` | per-venue position cap | 1000 |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |
 | `sizing.max_order_notional_usd` | per-slice cap | 500 |
+| `sizing.vwap_enabled` | current-orderbook VWAP + automatic sizing; `false` keeps legacy sizing | `true` in the example |
+| `sizing.min_order_usd` / `max_order_usd` | search range for automatic sizing | 1000 / 50000 |
+| `sizing.minimum_net_edge_bps` | minimum directional deviation after modeled costs | 6 |
+| `sizing.max_vwap_slippage_bps` / `max_book_impact_bps` | reject sizes that consume too much depth | 5 / 5 |
+| `sizing.safety_buffer_bps` / `expected_latency_cost_bps` | explicit deductions beyond fees and visible depth | 2 / 0 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
+| `execution.risk_recovery_enabled` / `hedge_timeout_ms` | one-leg timeout recovery | `true` / 250ms in the example |
+| `execution.max_unhedged_delta_usd` | delta threshold for emergency hedging | 5000 |
+| `kill_switch.enabled` | unified risk-event and persistent entry-pause handling | `true` in the example |
+| `kill_switch.emergency_flatten_enabled` | allow reduce-only flatten after severe persistent risk | `false` |
+| `accounting.enabled` | durable Pair ledger and restart snapshot | `true` in the example |
+| `funding.enabled` / `expected_holding_hours` | live two-venue funding cost | `true` / 1h in the example |
+| `stablecoin.enabled` | normalize each venue quote asset to USD and halt on depeg | `true` in the example |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
+| `market_data.enforce_book_age` | enable millisecond book-age rejection | `true` in the example |
+| `market_data.max_book_age_ms` | reject new trades if either book is older | `300` |
+| `session.enabled` | `false`: crypto 24/7; `true`: US-stock regular-session entry gate | `false` |
 | `recorder.*` | minute-data recorder | on, `logs/minutes.csv` |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
+
+### Market-data quality and latency
+
+Two freshness clocks are maintained. `execution.staleness_sec` checks whether
+the websocket is still receiving messages; `market_data.max_book_age_ms` checks
+when the order book itself last changed. With `enforce_book_age` enabled, a live
+heartbeat cannot make an old book tradable, and stale data disarms any pending
+signal.
+
+Hyperliquid's documented millisecond `time` on `l2Book` is used to observe
+exchange-to-local delay. The official Lighter order-book websocket currently
+does not expose a server timestamp, so only local receive time is recorded and
+exchange time remains unknown. Order ACK/fill timestamps are also local
+observation times, not matching-engine timestamps.
+
+Latency percentiles use the latest 2,000 in-memory observations and reset on
+restart. The example 300ms threshold is deliberately conservative; observe the
+actual update cadence and P95/P99 for the symbol and deployment before tuning it.
+
+### Crypto versus stock sessions
+
+Session awareness has one manual switch and never guesses from the symbol:
+
+```yaml
+session:
+  enabled: false  # crypto 24/7
+```
+
+Keep it `false` for crypto. Set it to `true` for stock perpetuals. Enabled mode
+uses US Eastern time and classifies pre-market, regular, after-hours, closed,
+weekends, standard US equity holidays, and recurring 13:00 ET early closes.
+Only the regular session permits OPEN/ADD. EXIT, emergency hedge, and emergency
+flatten remain available at all times.
+
+Each sampleable session owns a separate Dynamic Midline, volatility, Z-score,
+and regime detector, so pre-market and after-hours observations cannot move the
+regular-session baseline. If a Pair is already open while a new session bank is
+warming up, EXIT may use the last ready baseline as a conservative risk-reducing
+fallback. The built-in core hours and calendar conventions follow the
+[NYSE trading-hours calendar](https://www.nyse.com/trade/hours-calendars).
+Unscheduled national closures and venue-specific oracle rules cannot be
+predicted by a static calendar; stale feeds and venue failures still fail
+closed through the existing risk guards.
+
+### Current-orderbook VWAP and automatic sizing
+
+This is **not candle/TradingView VWAP**. For each candidate base quantity, the
+engine walks the current buy asks and sell bids level by level, computes each
+leg's volume-weighted fill price, and evaluates:
+
+```
+expected net profit
+  = sell VWAP notional - buy VWAP notional
+  - both taker fees
+  - safety buffer - configured expected latency cost
+```
+
+Visible order-book slippage is already embedded in the two VWAP notionals and
+is not deducted a second time. The engine then binary-searches the largest
+shared base quantity that satisfies the minimum order, maximum order, net-edge,
+VWAP-slippage, book-impact, venue minimum, and position-headroom constraints.
+Insufficient depth or a failing constraint produces no order.
+
+In Static mode, `minimum_net_edge_bps` is a minimum **directional deviation
+from the configured midline after modeled costs** and is combined with the
+legacy upper/lower band. In Dynamic mode the Z-score lifecycle determines
+OPEN/ADD/EXIT and supplies the executable VWAP hurdle directly; the legacy
+bands are ignored. When enabled, fresh two-venue funding rates and quote-asset
+USD prices are included before the minimum net edge is checked. Missing or
+stale enabled cost data fails closed for OPEN/ADD.
+
+### Dynamic midline, Z-score, and regime detection
+
+When `midline.mode: dynamic`, the engine samples the fresh mid-to-mid premium
+at most once per second and maintains:
+
+```
+Fast Midline = time-based 5-minute EMA
+Slow Midline = 30-minute rolling median (the trading baseline)
+deviation    = current spread - Slow Midline
+Z-score      = deviation / max(rolling volatility, volatility floor)
+```
+
+Volatility can use population standard deviation or normal-consistent MAD
+(`1.4826 × median absolute deviation`). Until `min_samples` exists inside the
+rolling windows, dynamic mode is `WARMUP` and **new entries are blocked**. It
+does not silently trade against the configured static value. State is in
+memory and warms again after restart.
+
+The Fast EMA never becomes the sole trading baseline. With `regime.enabled`,
+the guard watches Fast/Slow divergence, absolute spread, and absolute Z-score.
+An abnormal condition must remain present for `break_persist_seconds` before
+the engine enters `PAUSE_NEW_ENTRY`; recovery must remain continuously healthy
+for `recovery_persist_seconds`. A pause disarms both strategy directions but
+does not flatten positions or disable emergency delta hedging.
+
+Dynamic mode uses Z-score as the primary lifecycle signal:
+
+```
+flat:                 Z >= +entry_z  -> OPEN sell-Entropy pair
+flat:                 Z <= -entry_z  -> OPEN buy-Entropy pair
+same-direction pair:  beyond entry_z -> ADD
+sell-Entropy pair:    Z <= +exit_z   -> EXIT by buying Entropy
+buy-Entropy pair:     Z >= -exit_z   -> EXIT by selling Entropy
+```
+
+An EXIT is hard-capped to the remaining matched Pair base quantity, so a
+return-to-center signal cannot reverse into a new position. The executable
+VWAP and modeled-cost check remains mandatory; therefore an exit may wait past
+the exact Z boundary when the bid/ask spread or fees make that snapshot
+untradeable. In Dynamic mode, `upper_bps` / `lower_bps` no longer drive the
+signal; they remain solely for Static compatibility.
+
+The runtime maintains a matched `PairPosition` (ID, direction, remaining base)
+and conservatively infers an existing matched pair from venue positions on
+startup. Each new execution attempt also has an evented state machine. With
+`accounting.enabled`, the open Pair, the last 200 completed Pairs, execution
+events, risk events, persistent pauses, and pending emergency flatten are
+restored from an atomically replaced snapshot. Audit events are appended to
+JSONL and flushed to disk.
+
+### Pair PnL, funding, and quote-asset basis
+
+One Pair record aggregates OPEN, ADD, EXIT, and emergency-flatten fills. It
+stores entry/exit spread, Z-score and midline, per-leg entry/exit VWAP, fees,
+expected and venue-reconciled funding, quote-basis adjustment, entry/exit
+slippage, entry/exit market session, gross/net PnL, holding time, and maximum
+adverse/favorable spread.
+
+Funding uses each venue's current rate. Hyperliquid's asset context is already
+hourly; Lighter's cross-exchange endpoint is documented as an 8-hour-equivalent
+rate and is divided by eight. The opening cost model applies the configured
+expected holding time. While a Pair is open, account funding history replaces
+the estimate with venue-reported payments when available.
+
+Quote prices are normalized before executable edge is calculated:
+
+```text
+adjusted gross edge
+  = sell VWAP × sell quote/USD
+  - buy VWAP  × buy quote/USD
+```
+
+The example reads level-1 `ASSET-USD` books from Coinbase Exchange. A missing or
+stale source blocks OPEN/ADD. `warning_deviation_bps` is observable; crossing
+`halt_deviation_bps` pauses new exposure. Set each venue's `quote_asset`
+correctly; the defaults are USDC for Entropy/Lighter mainnet/trade.xyz and USDG
+for Lighter Robinhood.
 
 ## Credentials (`.env`, live only)
 
@@ -194,12 +373,65 @@ errors), credentials in `.env`, and the markets on the command line
 - **Net-delta hedge**: if legs fill unevenly, the imbalance is immediately
   reduced (reduce-only, price-protected), and positions are reconciled
   against the chain every `reconcile_sec`.
-- **Failure containment**: a rate-limited venue pauses briefly; an
-  unreachable venue (e.g. exchange maintenance) pauses trading and is probed
-  every `venue_probe_sec` until it recovers; `max_consecutive_errors`
-  execution pathologies halt the engine entirely.
+- **One-leg timeout recovery**: with `risk_recovery_enabled`, both order tasks
+  remain tracked. If only one OPEN/ADD leg has a confirmed fill by
+  `hedge_timeout_ms`, the engine immediately sends a reduce-only reversal on
+  that venue. It does not blindly unwind an EXIT while the other outcome is
+  unknown; it waits for settlement and then restores net delta.
+- **Failure containment**: a rate-limited venue pauses briefly; an unreachable
+  venue is probed every `venue_probe_sec`. With the Kill Switch enabled,
+  repeated execution failures pause new entries instead of continuing to add
+  exposure.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
+
+### Execution state machine
+
+```text
+NEW -> SIGNAL_CONFIRMED -> ORDERS_SENT
+                              |       \
+                              |        -> BOTH_FILLED -> COMPLETE
+                              v
+                           PARTIAL -> RECOVERY -> HEDGED -> COMPLETE
+                                         \
+                                          -> UNWINDING -> COMPLETE / FAILED
+```
+
+Every transition records timestamp, reason, Pair ID, and data. `RECOVERY` has
+priority over expected arbitrage profit: the objective becomes restoring Delta
+Neutral. `UNWINDING` is part of the state contract for full pair unwind flows;
+the current immediate known-leg reversal remains recorded inside `RECOVERY`
+because the counterpart may still settle afterward.
+
+### Kill Switch
+
+The runtime records typed risk events with one of `PAUSE_NEW_ENTRY`,
+`EMERGENCY_HEDGE`, or `EMERGENCY_FLATTEN`:
+
+- persistent net delta above `max_unhedged_delta_usd` for longer than
+  `max_unhedged_duration_ms`;
+- consecutive unequal/partial fills;
+- consecutive execution failures;
+- chain/local position reconciliation mismatch;
+- session MTM loss limit, when configured;
+- transient websocket/book staleness, venue API outage, and regime break.
+
+Persistent triggers block OPEN/ADD but continue to allow risk-reducing EXIT and
+hedging. Restart alone does not clear them. After operator review, restart with
+`--clear-risk-pause`; the engine clears them only after live reconciliation
+confirms both venues are flat and no emergency flatten is pending. Emergency
+flatten is deliberately disabled by default. When enabled, a failed, locked,
+bookless, or disconnected venue remains a persisted pending task and is retried
+every `emergency_flatten_retry_sec`; zero max attempts means retry until flat.
+No client can guarantee a fill while an external exchange is unavailable.
+
+Example operator reset after independently confirming that both venues are
+flat (this performs live reconciliation; it is intentionally unavailable in
+`--record-only` mode):
+
+```bash
+python3 main.py --symbol SNDK --hedge lighter-rh --clear-risk-pause
+```
 
 ## Layout
 
@@ -207,6 +439,13 @@ errors), credentials in `.env`, and the markets on the command line
 main.py                  entry point (--record-only, or live by default)
 entropy_arb/config.py    YAML + .env contract, validation
 entropy_arb/book.py      order books + fee-aware crossing/sizing math
+entropy_arb/pricing.py   current-book VWAP, executable edge, binary sizing
+entropy_arb/midline.py   Fast/Slow baseline, volatility, Z-score, regime guard
+entropy_arb/models.py    minimal Pair position + execution/risk contracts
+entropy_arb/costs.py     funding forecast + quote/USD basis freshness guard
+entropy_arb/ledger.py    durable Pair PnL ledger + restart snapshot
+entropy_arb/metrics.py   rolling execution-latency percentiles
+entropy_arb/session.py   one-switch crypto/US-equity session clock
 entropy_arb/feeds.py     official HL ws + zkLighter ws book feeds
 entropy_arb/venue_hl.py  Hyperliquid dex adapter (Entropy, tradexyz)
 entropy_arb/venue_lighter.py  zkLighter adapter (mainnet, Robinhood chain)
@@ -219,20 +458,25 @@ tests/                   python3 -m pytest tests/
 
 ## Known risks
 
-- **A wrong midline is a losing strategy.** The premium center drifts;
-  re-measure regularly and keep `config.yaml` current.
-- **USDG basis** (`lighter-rh`): the hedge quotes in USDG. Part of any
-  persistent premium is the stablecoin itself; your midline absorbs the
-  level, but a USDG *move* is real PnL.
-- **Funding**: two venues, two independent funding rates; carry is not
-  modeled. Position caps bound it — keep them modest.
-- **Thin books**: Entropy depth can be tiny; `take_fraction` and notional
-  caps keep clips small, but slippage on the hedge leg after a partial fill
-  is real.
-- **Market hours**: for equity perps (e.g. SNDK), off-hours oracle regimes
-  differ per venue; consider wider bands or not trading them.
-- **One-leg risk**: a leg can fail after the other filled. The bot hedges
-  and reconciles automatically, but you should still watch it.
+- **A wrong or contaminated baseline is a losing strategy.** Dynamic mode
+  reduces manual drift but cannot distinguish every oracle/quote-asset change;
+  keep the regime limits conservative and inspect recorded data.
+- **Quote-source basis**: the independent basis guard removes known quote/USD
+  movement, but the external spot source can itself be stale, unavailable, or
+  less executable than its top of book. Enabled stale data blocks new entries.
+- **Funding forecast error**: the entry model extrapolates the current rate for
+  `expected_holding_hours`; future hourly rates can change. Venue history is
+  reconciled into Pair PnL after the fact, not predicted perfectly.
+- **Thin books**: VWAP sizing rejects clips that exceed visible slippage or
+  impact limits, but the book can still move after the signal and slippage on
+  a recovery hedge after a partial fill is real.
+- **Trading-calendar exceptions**: stock mode handles recurring US-equity
+  holidays and early closes, but cannot predict unscheduled national closures,
+  venue-specific oracle freezes, or exchange rule changes. Session-disabled
+  crypto mode is intentionally 24/7.
+- **One-leg/exchange outage risk**: the bot persists and retries recovery, but
+  cannot force an unavailable exchange to accept or fill an order. Manual
+  operational monitoring remains necessary.
 
 Use at your own risk. This is trading software operating with real money;
 nothing here is investment advice. Start with tiny position caps.

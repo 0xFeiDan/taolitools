@@ -38,6 +38,18 @@ AUTH_REFRESH_SEC = 8 * 60
 REST_TIMEOUT = 10.0
 
 
+def _timed_result(result: dict, *, order_send_ts: Optional[float] = None,
+                  order_ack_ts: Optional[float] = None,
+                  fill_ts: Optional[float] = None) -> dict:
+    result.update({
+        "order_send_ts": order_send_ts,
+        "order_ack_ts": order_ack_ts,
+        "first_fill_ts": fill_ts,
+        "final_fill_ts": fill_ts,
+    })
+    return result
+
+
 class AccountOrdersFeed:
     """Authenticated stream of our own order updates (settlement channel)."""
 
@@ -85,9 +97,12 @@ class AccountOrdersFeed:
                     continue
                 fb = float(o.get("filled_base_amount") or 0.0)
                 fq = float(o.get("filled_quote_amount") or 0.0)
-                self._resolve(coi, {"status": status, "filled_base": fb,
-                                    "filled_quote": fq,
-                                    "avg_px": (fq / fb) if fb > 0 else None})
+                self._resolve(coi, {
+                    "status": status, "filled_base": fb,
+                    "filled_quote": fq,
+                    "avg_px": (fq / fb) if fb > 0 else None,
+                    "observed_ts": time.time(),
+                })
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0
@@ -277,6 +292,7 @@ class LighterVenue:
         fut = self.orders_feed.watch(coi) if self.orders_feed else None
         base_amount = int(round(qty * 10 ** self.size_decimals))
         price = int(round(limit_px * 10 ** self.price_decimals))
+        order_send_ts = time.time()
         try:
             _tx, resp, err = await self.signer.create_order(
                 market_index=self.market_id,
@@ -295,8 +311,11 @@ class LighterVenue:
             msg = f"{type(e).__name__}: {e}"
             if getattr(e, "status", None) == 429 or "(429)" in str(e):
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return _timed_result(
+                {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
+                 "err": msg, "unresolved": False},
+                order_send_ts=order_send_ts)
+        order_ack_ts = time.time()
         if err is not None or (getattr(resp, "code", 200) or 200) != 200:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
@@ -304,21 +323,34 @@ class LighterVenue:
                 f"tx rejected code={resp.code} msg={getattr(resp, 'message', None)}"
             if "rate limit" in msg.lower():
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return _timed_result(
+                {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
+                 "err": msg, "unresolved": False},
+                order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
         if fut is None:
-            return {"status": "sent-unconfirmed", "filled_base": 0.0,
-                    "avg_px": None, "err": None, "unresolved": True}
+            return _timed_result(
+                {"status": "sent-unconfirmed", "filled_base": 0.0,
+                 "avg_px": None, "err": None, "unresolved": True},
+                order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
         try:
             info = await asyncio.wait_for(fut, timeout=self.settle_timeout)
-            return {"status": info["status"], "filled_base": info["filled_base"],
-                    "avg_px": info.get("avg_px"), "err": None, "unresolved": False}
+            fill_ts = (info.get("observed_ts")
+                       if info.get("filled_base", 0.0) > 0 else None)
+            return _timed_result(
+                {"status": info["status"],
+                 "filled_base": info["filled_base"],
+                 "avg_px": info.get("avg_px"), "err": None,
+                 "unresolved": False},
+                order_send_ts=order_send_ts, order_ack_ts=order_ack_ts,
+                fill_ts=fill_ts)
         except asyncio.TimeoutError:
             self.orders_feed.unwatch(coi)
             log.warning("[%s] no settle confirmation for coi %d in %.1fs",
                         self.name, coi, self.settle_timeout)
-            return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                    "err": None, "unresolved": True}
+            return _timed_result(
+                {"status": "timeout", "filled_base": 0.0, "avg_px": None,
+                 "err": None, "unresolved": True},
+                order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
 
     # -------------------------------------------------------------- accounts
 
@@ -348,6 +380,46 @@ class LighterVenue:
             if int(p.get("market_id", -1)) == self.market_id:
                 return float(p.get("sign") or 1.0) * float(p.get("position") or 0.0)
         return 0.0
+
+    async def fetch_funding_rate(self) -> float:
+        """Current Lighter rate normalized by the API to an 8h equivalent."""
+        data = await self._get("/api/v1/funding-rates")
+        candidates = []
+        for row in data.get("funding_rates") or []:
+            if int(row.get("market_id", -1)) != self.market_id:
+                continue
+            candidates.append(row)
+            if str(row.get("exchange", "")).lower() == "lighter":
+                return float(row.get("rate") or 0.0) / 8.0
+        if candidates:
+            return float(candidates[0].get("rate") or 0.0) / 8.0
+        raise RuntimeError(f"[{self.name}] funding rate for market "
+                           f"{self.market_id} missing")
+
+    async def fetch_funding_cost_since(self, start_ts: float) -> float:
+        """Sum public account funding entries; positive means paid."""
+        c = self.conf.lighter_creds
+        if c is None or c.account_index is None:
+            raise RuntimeError(f"[{self.name}] account index unavailable")
+        data = await self._get("/api/v1/positionFunding", params={
+            "account_index": c.account_index,
+            "market_id": self.market_id,
+            "limit": 100,
+            "side": "all",
+            "start_timestamp": int(start_ts * 1000),
+        })
+        total = 0.0
+        for row in (data.get("position_fundings")
+                    or data.get("fundings") or []):
+            # API versions have used either funding_paid_out or change. The
+            # former is a cost; the latter is an account cash change.
+            if row.get("funding_paid_out") is not None:
+                total += float(row["funding_paid_out"])
+            elif row.get("change") is not None:
+                total -= float(row["change"])
+            elif row.get("amount") is not None:
+                total += float(row["amount"])
+        return total
 
     async def close(self) -> None:
         if self.signer is not None:

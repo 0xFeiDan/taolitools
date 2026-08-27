@@ -53,8 +53,9 @@ def setup_logging(level: str, log_file: str = None,
 
 
 async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
-                log_buffer, lang: str) -> None:
-    eng = Engine(cfg, record_only=record_only)
+                log_buffer, lang: str, clear_risk_pause: bool = False) -> None:
+    eng = Engine(cfg, record_only=record_only,
+                 clear_risk_pause=clear_risk_pause)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, eng.request_stop)
@@ -94,6 +95,9 @@ def main() -> None:
     p.add_argument("--record-only", action="store_true",
                    help="only collect minute data, run no strategy, send no "
                         "orders (needs no credentials)")
+    p.add_argument("--clear-risk-pause", action="store_true",
+                   help="clear persisted Kill Switch pauses only after live "
+                        "position reconciliation confirms both venues are flat")
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()
@@ -102,10 +106,14 @@ def main() -> None:
     disp.add_argument("--no-dashboard", action="store_true",
                       help="plain console logs instead of the dashboard")
     args = p.parse_args()
+    if args.clear_risk_pause and args.record_only:
+        p.error("--clear-risk-pause requires live account reconciliation and "
+                "cannot be used with --record-only")
 
     try:
         cfg = load_config(args.config, args.env_file,
                           symbol=args.symbol, hedge_venue=args.hedge)
+        cfg.require_runtime_supported()
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         sys.exit(2)
@@ -134,7 +142,8 @@ def main() -> None:
         asyncio.run(amain(cfg, record_only=args.record_only,
                           use_dashboard=use_dashboard, force_tty=force_tty,
                           log_buffer=log_buffer,
-                          lang="zh" if args.cn else "en"))
+                          lang="zh" if args.cn else "en",
+                          clear_risk_pause=args.clear_risk_pause))
     except RuntimeError as e:
         # startup failures (missing credentials, market not found, venue
         # unreachable) — a clean message, not a traceback

@@ -9,14 +9,17 @@ HLBookFeed: the official Hyperliquid websocket (wss://api.hyperliquid.xyz/ws)
     l2Book channel with fast snapshots and client app-pings. Every price this
     bot trades on comes straight from the exchange that will fill the order.
 
-Both touch the book on any inbound frame (connection-based freshness: a quiet
-market is not stale, only a dead feed is) and reconnect with backoff.
+Both retain connection heartbeat timestamps and actual book-update timestamps.
+Hyperliquid's documented millisecond ``time`` is also stored; the official
+Lighter websocket client does not expose a server timestamp, so its exchange
+timestamp remains unknown rather than being fabricated.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
 from typing import Callable, Optional
 
 try:
@@ -27,6 +30,33 @@ except ImportError:
 from .book import OrderBook
 
 log = logging.getLogger("feeds")
+
+
+def _epoch_seconds(value) -> Optional[float]:
+    """Normalize common epoch units to seconds; unknown values stay absent."""
+    if value in (None, ""):
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    magnitude = abs(ts)
+    if magnitude >= 1e17:       # nanoseconds
+        return ts / 1e9
+    if magnitude >= 1e14:       # microseconds
+        return ts / 1e6
+    if magnitude >= 1e11:       # milliseconds (documented Hyperliquid unit)
+        return ts / 1e3
+    return ts
+
+
+def _lighter_exchange_ts(msg: dict, ob: dict) -> Optional[float]:
+    """Accept a future timestamp field without assuming one exists today."""
+    for source in (ob, msg):
+        for key in ("timestamp", "time", "ts"):
+            if key in source:
+                return _epoch_seconds(source.get(key))
+    return None
 
 
 def _chan_id(channel: str) -> Optional[int]:
@@ -57,14 +87,17 @@ class LighterBookFeed:
         await ws.send(json.dumps({"type": "subscribe",
                                   "channel": f"order_book/{self.market_id}"}))
 
-    async def _handle_book(self, ws, msg: dict, snapshot: bool) -> None:
+    async def _handle_book(self, ws, msg: dict, snapshot: bool, *,
+                           received_ts: Optional[float] = None) -> None:
         if _chan_id(msg.get("channel", "")) != self.market_id:
             return
         ob = msg["order_book"]
         if snapshot:
             self._nonce = ob.get("nonce")
             self._synced = True
-            self.book.apply_lighter(ob, snapshot=True)
+            self.book.apply_lighter(
+                ob, snapshot=True, received_ts=received_ts,
+                exchange_ts=_lighter_exchange_ts(msg, ob))
             log.info("[%s] snapshot: %d bids / %d asks", self.name,
                      len(self.book.bids), len(self.book.asks))
             self.notify()
@@ -80,6 +113,7 @@ class LighterBookFeed:
             self._nonce = None
             self._synced = False
             self.book.clear()
+            self.book.mark_connected()
             self.notify()
             await ws.send(json.dumps({"type": "unsubscribe",
                                       "channel": f"order_book/{self.market_id}"}))
@@ -87,28 +121,37 @@ class LighterBookFeed:
             return
         if end is not None:
             self._nonce = end
-        self.book.apply_lighter(ob, snapshot=False)
+        self.book.apply_lighter(
+            ob, snapshot=False, received_ts=received_ts,
+            exchange_ts=_lighter_exchange_ts(msg, ob))
         self.notify()
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0
         while not stop.is_set():
+            self.book.mark_connecting()
             try:
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
                     log.info("[%s] connected (%s)", self.name, self.ws_url)
                     self.book.clear()
+                    self.book.mark_connected()
                     self._nonce = None
                     self._synced = False
                     async for raw in ws:
                         backoff = 1.0
+                        received_ts = time.time()
                         msg = json.loads(raw)
                         t = msg.get("type")
-                        self.book.touch()
+                        self.book.touch(received_ts)
                         if t == "update/order_book":
-                            await self._handle_book(ws, msg, snapshot=False)
+                            await self._handle_book(
+                                ws, msg, snapshot=False,
+                                received_ts=received_ts)
                         elif t == "subscribed/order_book":
-                            await self._handle_book(ws, msg, snapshot=True)
+                            await self._handle_book(
+                                ws, msg, snapshot=True,
+                                received_ts=received_ts)
                         elif t == "connected":
                             await self._subscribe(ws)
                         elif t == "ping":
@@ -120,7 +163,7 @@ class LighterBookFeed:
             except Exception as e:
                 log.warning("[%s] ws error: %s — reconnect in %.0fs",
                             self.name, e, backoff)
-            self.book.ready = False
+            self.book.mark_disconnected("websocket closed")
             self.notify()
             if stop.is_set():
                 break
@@ -141,12 +184,16 @@ class HLBookFeed:
         self.ping_sec = ping_sec
         self._snapped = False
 
-    def _on_frame(self, msg: dict) -> None:
-        self.book.touch()
+    def _on_frame(self, msg: dict,
+                  received_ts: Optional[float] = None) -> None:
+        received_ts = time.time() if received_ts is None else received_ts
+        self.book.touch(received_ts)
         if msg.get("channel") == "l2Book":
             d = msg.get("data") or {}
             if d.get("coin") == self.coin:
-                self.book.apply_hl(d["levels"])
+                self.book.apply_hl(
+                    d["levels"], received_ts=received_ts,
+                    exchange_ts=_epoch_seconds(d.get("time")))
                 if not self._snapped:
                     self._snapped = True
                     log.info("[%s] snapshot: %d bids / %d asks", self.name,
@@ -170,11 +217,13 @@ class HLBookFeed:
         backoff = 1.0
         while not stop.is_set():
             ptask = None
+            self.book.mark_connecting()
             try:
                 async with ws_connect(self.ws_url, max_size=2**23, open_timeout=10,
                                       ping_interval=15, ping_timeout=15) as ws:
                     log.info("[%s] connected (official ws, %s)", self.name, self.coin)
                     self.book.clear()
+                    self.book.mark_connected()
                     self._snapped = False
                     await ws.send(json.dumps({
                         "method": "subscribe",
@@ -183,7 +232,7 @@ class HLBookFeed:
                     ptask = asyncio.create_task(self._pinger(ws))
                     async for raw in ws:
                         backoff = 1.0
-                        self._on_frame(json.loads(raw))
+                        self._on_frame(json.loads(raw), received_ts=time.time())
                         if stop.is_set():
                             break
             except asyncio.CancelledError:
@@ -194,7 +243,7 @@ class HLBookFeed:
             finally:
                 if ptask is not None:
                     ptask.cancel()
-            self.book.ready = False
+            self.book.mark_disconnected("websocket closed")
             self.notify()
             if stop.is_set():
                 break

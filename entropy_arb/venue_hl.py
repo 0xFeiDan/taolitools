@@ -31,6 +31,18 @@ log = logging.getLogger("hl")
 INFO_TIMEOUT = 10.0
 
 
+def _timed_result(result: dict, *, order_send_ts: Optional[float] = None,
+                  order_ack_ts: Optional[float] = None,
+                  fill_ts: Optional[float] = None) -> dict:
+    result.update({
+        "order_send_ts": order_send_ts,
+        "order_ack_ts": order_ack_ts,
+        "first_fill_ts": fill_ts,
+        "final_fill_ts": fill_ts,
+    })
+    return result
+
+
 class NonceAllocator:
     def __init__(self) -> None:
         self._last = 0
@@ -197,17 +209,25 @@ class HLVenue:
             payload = {"action": action, "nonce": nonce, "signature": sig,
                        "vaultAddress": None, "expiresAfter": None}
         except Exception as e:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": f"signing failed: {e!r}", "unresolved": False}
+            return _timed_result({
+                "status": "send-failed", "filled_base": 0.0, "avg_px": None,
+                "err": f"signing failed: {e!r}", "unresolved": False})
 
+        order_send_ts = time.time()
         body, err, unresolved = await self._post_exchange(payload)
+        order_ack_ts = None if unresolved else time.time()
         if err is not None:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": err, "unresolved": False}
+            return _timed_result(
+                {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
+                 "err": err, "unresolved": False},
+                order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
         if not unresolved:
             res = self._parse(body)
             if not res.get("unresolved"):
-                return res
+                fill_ts = time.time() if res.get("filled_base", 0.0) > 0 else None
+                return _timed_result(
+                    res, order_send_ts=order_send_ts,
+                    order_ack_ts=order_ack_ts, fill_ts=fill_ts)
         # unknown outcome: poll orderStatus by cloid until the deadline
         deadline = time.time() + self.settle_timeout
         while time.time() < deadline:
@@ -227,11 +247,18 @@ class HLVenue:
                 except (TypeError, ValueError):
                     filled = 0.0
                 if status != "open":
-                    return {"status": status, "filled_base": filled,
-                            "avg_px": None, "err": None, "unresolved": False}
+                    observed_ts = time.time()
+                    return _timed_result(
+                        {"status": status, "filled_base": filled,
+                         "avg_px": None, "err": None, "unresolved": False},
+                        order_send_ts=order_send_ts,
+                        order_ack_ts=order_ack_ts or observed_ts,
+                        fill_ts=observed_ts if filled > 0 else None)
             await asyncio.sleep(0.5)
-        return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                "err": None, "unresolved": True}
+        return _timed_result(
+            {"status": "timeout", "filled_base": 0.0, "avg_px": None,
+             "err": None, "unresolved": True},
+            order_send_ts=order_send_ts, order_ack_ts=order_ack_ts)
 
     async def _post_exchange(self, payload: dict):
         try:
@@ -330,6 +357,32 @@ class HLVenue:
             if pos.get("coin") == self.coin:
                 return float(pos.get("szi") or 0.0)
         return 0.0
+
+    async def fetch_funding_rate(self) -> float:
+        """Current hourly funding rate from the official asset context."""
+        data = await self._info({"type": "metaAndAssetCtxs",
+                                 "dex": self.conf.hl_dex})
+        meta, contexts = data
+        for index, asset in enumerate(meta.get("universe") or []):
+            if asset.get("name") == self.coin:
+                return float(contexts[index].get("funding") or 0.0)
+        raise RuntimeError(f"[{self.name}] funding context for {self.coin} missing")
+
+    async def fetch_funding_cost_since(self, start_ts: float) -> float:
+        """Account funding cost since start (positive means paid)."""
+        addr = self._query_address()
+        if addr is None:
+            raise RuntimeError(f"[{self.name}] account address unavailable")
+        payload = {"type": "userFunding", "user": addr,
+                   "startTime": int(start_ts * 1000),
+                   "dex": self.conf.hl_dex}
+        rows = await self._info(payload)
+        received = 0.0
+        for row in rows or []:
+            delta = row.get("delta") or {}
+            if delta.get("coin") == self.coin:
+                received += float(delta.get("usdc") or 0.0)
+        return -received
 
     async def close(self) -> None:
         pass

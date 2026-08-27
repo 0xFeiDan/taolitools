@@ -86,12 +86,117 @@ class VenueConf:
     fee_bps: float
     cap_usd: float
     orders_per_min: int
+    quote_asset: str = "USD"
     # hl
     hl_dex: str = ""
     hl_creds: Optional[HLCreds] = None
     # lighter
     lighter_profile: Optional[LighterProfile] = None
     lighter_creds: Optional[LighterCreds] = None
+
+
+@dataclass(frozen=True)
+class MidlineConfig:
+    """V2 midline contract.
+
+    ``thresholds.midline_bps`` remains the static value and warm-up display
+    seed. Dynamic trading fails closed until the estimator is ready.
+    """
+
+    mode: str
+    fast_method: str
+    fast_window_seconds: float
+    slow_method: str
+    slow_window_seconds: float
+    min_samples: int
+    volatility_method: str
+    volatility_window_seconds: float
+    volatility_floor_bps: float
+    entry_z_score: float
+    exit_z_score: float
+
+
+@dataclass(frozen=True)
+class RegimeConfig:
+    enabled: bool
+    max_fast_slow_difference_bps: float
+    max_z_score: float
+    max_absolute_spread_bps: float
+    break_persist_seconds: float
+    recovery_persist_seconds: float
+
+
+@dataclass(frozen=True)
+class MarketDataConfig:
+    enforce_book_age: bool
+    max_book_age_ms: float
+
+
+@dataclass(frozen=True)
+class VwapSizingConfig:
+    enabled: bool
+    min_order_usd: float
+    max_order_usd: float
+    minimum_net_edge_bps: float
+    max_vwap_slippage_bps: float
+    max_book_impact_bps: float
+    safety_buffer_bps: float
+    expected_latency_cost_bps: float
+
+
+@dataclass(frozen=True)
+class ExecutionRiskConfig:
+    enabled: bool
+    hedge_timeout_ms: float
+    max_unhedged_delta_usd: float
+
+
+@dataclass(frozen=True)
+class KillSwitchConfig:
+    enabled: bool
+    max_unhedged_duration_ms: float
+    max_consecutive_partial_fills: int
+    max_reconcile_mismatch_usd: float
+    max_session_loss_usd: float
+    emergency_flatten_enabled: bool
+    emergency_flatten_retry_sec: float
+    emergency_flatten_max_attempts: int
+
+
+@dataclass(frozen=True)
+class AccountingConfig:
+    enabled: bool
+    ledger_jsonl: str
+    state_json: str
+
+
+@dataclass(frozen=True)
+class FundingConfig:
+    enabled: bool
+    expected_holding_hours: float
+    refresh_seconds: float
+    max_age_seconds: float
+
+
+@dataclass(frozen=True)
+class StablecoinConfig:
+    enabled: bool
+    source_url: str
+    refresh_seconds: float
+    max_age_seconds: float
+    warning_deviation_bps: float
+    halt_deviation_bps: float
+
+
+@dataclass(frozen=True)
+class SessionConfig:
+    """One-switch market-session contract.
+
+    Disabled is 24/7 crypto behavior. Enabled is US-equity regular-session
+    entry gating; the schedule itself is intentionally not user-configurable.
+    """
+
+    enabled: bool
 
 
 @dataclass
@@ -133,6 +238,17 @@ class Config:
     trades_csv: str
     dashboard: bool
     log_file: str
+    # V2 contracts.  All are opt-in so an existing config keeps V1 behavior.
+    midline: MidlineConfig
+    regime: RegimeConfig
+    market_data: MarketDataConfig
+    vwap_sizing: VwapSizingConfig
+    execution_risk: ExecutionRiskConfig
+    kill_switch: KillSwitchConfig
+    accounting: AccountingConfig
+    funding: FundingConfig
+    stablecoin: StablecoinConfig
+    session: SessionConfig
     # runtime
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
@@ -147,6 +263,24 @@ class Config:
                 return False
         return True
 
+    @property
+    def pending_v2_features(self) -> tuple[str, ...]:
+        """Compatibility hook for rejecting future config-only features.
+
+        Every option currently exposed by the V2 schema is wired into the
+        runtime, so the list is intentionally empty.
+        """
+        return ()
+
+    def require_runtime_supported(self) -> None:
+        pending = self.pending_v2_features
+        if pending:
+            raise ConfigError(
+                "V2 features are configured but not active in the engine yet: "
+                + ", ".join(pending)
+                + ". Keep them disabled until their implementation phase / "
+                  "这些 V2 功能目前只有配置契约，尚未接入引擎，请暂时关闭")
+
 
 # ----------------------------------------------------------------- YAML layer
 
@@ -157,21 +291,56 @@ _SCHEMA: Dict[str, Any] = {
         "upper_bps": float,
         "lower_bps": float,
     },
+    "midline": {
+        "mode": str,
+        "fast_method": str,
+        "fast_window_seconds": float,
+        "slow_method": str,
+        "slow_window_seconds": float,
+        "min_samples": int,
+        "volatility_method": str,
+        "volatility_window_seconds": float,
+        "volatility_floor_bps": float,
+        "entry_z_score": float,
+        "exit_z_score": float,
+    },
+    "regime": {
+        "enabled": bool,
+        "max_fast_slow_difference_bps": float,
+        "max_z_score": float,
+        "max_absolute_spread_bps": float,
+        "break_persist_seconds": float,
+        "recovery_persist_seconds": float,
+    },
+    "market_data": {
+        "enforce_book_age": bool,
+        "max_book_age_ms": float,
+    },
     "entropy": {
         "dex": str,
         "taker_fee_bps": float,
         "max_position_usd": float,
         "max_orders_per_min": int,
+        "quote_asset": str,
     },
     "hedge": {
         "taker_fee_bps": float,
         "max_position_usd": float,
         "max_orders_per_min": int,
+        "quote_asset": str,
     },
     "sizing": {
         "take_fraction": float,
         "max_order_notional_usd": float,
         "min_order_notional_usd": float,
+        "vwap_enabled": bool,
+        "min_order_usd": float,
+        "max_order_usd": float,
+        "minimum_net_edge_bps": float,
+        "max_vwap_slippage_bps": float,
+        "max_book_impact_bps": float,
+        "safety_buffer_bps": float,
+        "expected_latency_cost_bps": float,
     },
     "inventory": {
         "scale_bps": float,
@@ -190,6 +359,41 @@ _SCHEMA: Dict[str, Any] = {
         "reconcile_sec": float,
         "venue_probe_sec": float,
         "http_keepalive_sec": float,
+        "risk_recovery_enabled": bool,
+        "hedge_timeout_ms": float,
+        "max_unhedged_delta_usd": float,
+    },
+    "kill_switch": {
+        "enabled": bool,
+        "max_unhedged_duration_ms": float,
+        "max_consecutive_partial_fills": int,
+        "max_reconcile_mismatch_usd": float,
+        "max_session_loss_usd": float,
+        "emergency_flatten_enabled": bool,
+        "emergency_flatten_retry_sec": float,
+        "emergency_flatten_max_attempts": int,
+    },
+    "accounting": {
+        "enabled": bool,
+        "ledger_jsonl": str,
+        "state_json": str,
+    },
+    "funding": {
+        "enabled": bool,
+        "expected_holding_hours": float,
+        "refresh_seconds": float,
+        "max_age_seconds": float,
+    },
+    "stablecoin": {
+        "enabled": bool,
+        "source_url": str,
+        "refresh_seconds": float,
+        "max_age_seconds": float,
+        "warning_deviation_bps": float,
+        "halt_deviation_bps": float,
+    },
+    "session": {
+        "enabled": bool,
     },
     "recorder": {
         "enabled": bool,
@@ -238,6 +442,28 @@ def _get(d: dict, section: str, key: str, default):
     return (d.get(section) or {}).get(key, default)
 
 
+def _choice(value: str, valid: tuple[str, ...], path: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in valid:
+        raise ConfigError(f"'{path}' must be one of {list(valid)}, got "
+                          f"{value!r}")
+    return normalized
+
+
+def _positive(value: Any, path: str) -> float:
+    result = float(value)
+    if result <= 0:
+        raise ConfigError(f"'{path}' must be > 0, got {value!r}")
+    return result
+
+
+def _nonnegative(value: Any, path: str) -> float:
+    result = float(value)
+    if result < 0:
+        raise ConfigError(f"'{path}' must be >= 0, got {value!r}")
+    return result
+
+
 # ------------------------------------------------------------------ env layer
 
 def _env_s(name: str) -> Optional[str]:
@@ -256,7 +482,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 symbol: str, hedge_venue: str) -> Config:
     load_dotenv(env_file)
     try:
-        with open(config_file) as fh:
+        with open(config_file, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
     except FileNotFoundError:
         raise ConfigError(
@@ -291,6 +517,196 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                           "more than the profitable depth loses money on the "
                           "tail / 必须在 (0, 1] 之间")
 
+    midline = MidlineConfig(
+        mode=_choice(_get(raw, "midline", "mode", "static"),
+                     ("static", "dynamic"), "midline.mode"),
+        fast_method=_choice(_get(raw, "midline", "fast_method", "ema"),
+                            ("ema",), "midline.fast_method"),
+        fast_window_seconds=_positive(
+            _get(raw, "midline", "fast_window_seconds", 300.0),
+            "midline.fast_window_seconds"),
+        slow_method=_choice(_get(raw, "midline", "slow_method", "median"),
+                            ("median",), "midline.slow_method"),
+        slow_window_seconds=_positive(
+            _get(raw, "midline", "slow_window_seconds", 1800.0),
+            "midline.slow_window_seconds"),
+        min_samples=int(_get(raw, "midline", "min_samples", 300)),
+        volatility_method=_choice(
+            _get(raw, "midline", "volatility_method", "std"),
+            ("std", "mad"), "midline.volatility_method"),
+        volatility_window_seconds=_positive(
+            _get(raw, "midline", "volatility_window_seconds", 1800.0),
+            "midline.volatility_window_seconds"),
+        volatility_floor_bps=_positive(
+            _get(raw, "midline", "volatility_floor_bps", 0.1),
+            "midline.volatility_floor_bps"),
+        entry_z_score=_positive(
+            _get(raw, "midline", "entry_z_score", 2.5),
+            "midline.entry_z_score"),
+        exit_z_score=_nonnegative(
+            _get(raw, "midline", "exit_z_score", 0.5),
+            "midline.exit_z_score"),
+    )
+    if midline.min_samples <= 0:
+        raise ConfigError("'midline.min_samples' must be > 0")
+    if midline.slow_window_seconds < midline.fast_window_seconds:
+        raise ConfigError("midline.slow_window_seconds must be >= "
+                          "midline.fast_window_seconds")
+    if midline.exit_z_score >= midline.entry_z_score:
+        raise ConfigError("midline.exit_z_score must be < entry_z_score")
+    sample_capacity = int(min(midline.slow_window_seconds,
+                              midline.volatility_window_seconds)) + 1
+    if midline.min_samples > sample_capacity:
+        raise ConfigError(
+            "midline.min_samples exceeds the 1Hz capacity of the shortest "
+            "rolling window; increase the window or reduce min_samples")
+
+    regime = RegimeConfig(
+        enabled=bool(_get(raw, "regime", "enabled", False)),
+        max_fast_slow_difference_bps=_positive(
+            _get(raw, "regime", "max_fast_slow_difference_bps", 8.0),
+            "regime.max_fast_slow_difference_bps"),
+        max_z_score=_positive(_get(raw, "regime", "max_z_score", 5.0),
+                              "regime.max_z_score"),
+        max_absolute_spread_bps=_positive(
+            _get(raw, "regime", "max_absolute_spread_bps", 50.0),
+            "regime.max_absolute_spread_bps"),
+        break_persist_seconds=_nonnegative(
+            _get(raw, "regime", "break_persist_seconds", 1.0),
+            "regime.break_persist_seconds"),
+        recovery_persist_seconds=_nonnegative(
+            _get(raw, "regime", "recovery_persist_seconds", 30.0),
+            "regime.recovery_persist_seconds"),
+    )
+
+    market_data = MarketDataConfig(
+        enforce_book_age=bool(_get(raw, "market_data", "enforce_book_age", False)),
+        max_book_age_ms=_positive(
+            _get(raw, "market_data", "max_book_age_ms", 300.0),
+            "market_data.max_book_age_ms"),
+    )
+
+    vwap_sizing = VwapSizingConfig(
+        enabled=bool(_get(raw, "sizing", "vwap_enabled", False)),
+        min_order_usd=_positive(_get(raw, "sizing", "min_order_usd", 1000.0),
+                                "sizing.min_order_usd"),
+        max_order_usd=_positive(_get(raw, "sizing", "max_order_usd", 50000.0),
+                                "sizing.max_order_usd"),
+        minimum_net_edge_bps=_nonnegative(
+            _get(raw, "sizing", "minimum_net_edge_bps", 6.0),
+            "sizing.minimum_net_edge_bps"),
+        max_vwap_slippage_bps=_nonnegative(
+            _get(raw, "sizing", "max_vwap_slippage_bps", 5.0),
+            "sizing.max_vwap_slippage_bps"),
+        max_book_impact_bps=_nonnegative(
+            _get(raw, "sizing", "max_book_impact_bps", 5.0),
+            "sizing.max_book_impact_bps"),
+        safety_buffer_bps=_nonnegative(
+            _get(raw, "sizing", "safety_buffer_bps", 2.0),
+            "sizing.safety_buffer_bps"),
+        expected_latency_cost_bps=_nonnegative(
+            _get(raw, "sizing", "expected_latency_cost_bps", 0.0),
+            "sizing.expected_latency_cost_bps"),
+    )
+    if vwap_sizing.min_order_usd > vwap_sizing.max_order_usd:
+        raise ConfigError("sizing.min_order_usd must be <= sizing.max_order_usd")
+
+    execution_risk = ExecutionRiskConfig(
+        enabled=bool(_get(raw, "execution", "risk_recovery_enabled", False)),
+        hedge_timeout_ms=_positive(
+            _get(raw, "execution", "hedge_timeout_ms", 250.0),
+            "execution.hedge_timeout_ms"),
+        max_unhedged_delta_usd=_positive(
+            _get(raw, "execution", "max_unhedged_delta_usd", 5000.0),
+            "execution.max_unhedged_delta_usd"),
+    )
+
+    kill_switch = KillSwitchConfig(
+        enabled=bool(_get(raw, "kill_switch", "enabled", False)),
+        max_unhedged_duration_ms=_positive(
+            _get(raw, "kill_switch", "max_unhedged_duration_ms", 1000.0),
+            "kill_switch.max_unhedged_duration_ms"),
+        max_consecutive_partial_fills=int(_get(
+            raw, "kill_switch", "max_consecutive_partial_fills", 3)),
+        max_reconcile_mismatch_usd=_positive(
+            _get(raw, "kill_switch", "max_reconcile_mismatch_usd", 1000.0),
+            "kill_switch.max_reconcile_mismatch_usd"),
+        max_session_loss_usd=_nonnegative(
+            _get(raw, "kill_switch", "max_session_loss_usd", 0.0),
+            "kill_switch.max_session_loss_usd"),
+        emergency_flatten_enabled=bool(_get(
+            raw, "kill_switch", "emergency_flatten_enabled", False)),
+        emergency_flatten_retry_sec=_positive(_get(
+            raw, "kill_switch", "emergency_flatten_retry_sec", 2.0),
+            "kill_switch.emergency_flatten_retry_sec"),
+        emergency_flatten_max_attempts=int(_get(
+            raw, "kill_switch", "emergency_flatten_max_attempts", 0)),
+    )
+    if kill_switch.max_consecutive_partial_fills <= 0:
+        raise ConfigError(
+            "'kill_switch.max_consecutive_partial_fills' must be > 0")
+    if kill_switch.emergency_flatten_max_attempts < 0:
+        raise ConfigError(
+            "'kill_switch.emergency_flatten_max_attempts' must be >= 0")
+
+    accounting = AccountingConfig(
+        enabled=bool(_get(raw, "accounting", "enabled", False)),
+        ledger_jsonl=str(_get(
+            raw, "accounting", "ledger_jsonl", "logs/pair-ledger.jsonl")),
+        state_json=str(_get(
+            raw, "accounting", "state_json", "logs/runtime-state.json")),
+    )
+    if accounting.enabled and (not accounting.ledger_jsonl
+                               or not accounting.state_json):
+        raise ConfigError("accounting paths must not be empty when enabled")
+    if (accounting.enabled
+            and os.path.abspath(accounting.ledger_jsonl)
+            == os.path.abspath(accounting.state_json)):
+        raise ConfigError("accounting.ledger_jsonl and accounting.state_json "
+                          "must be different files")
+
+    funding = FundingConfig(
+        enabled=bool(_get(raw, "funding", "enabled", False)),
+        expected_holding_hours=_positive(_get(
+            raw, "funding", "expected_holding_hours", 1.0),
+            "funding.expected_holding_hours"),
+        refresh_seconds=_positive(_get(
+            raw, "funding", "refresh_seconds", 60.0),
+            "funding.refresh_seconds"),
+        max_age_seconds=_positive(_get(
+            raw, "funding", "max_age_seconds", 180.0),
+            "funding.max_age_seconds"),
+    )
+    stablecoin = StablecoinConfig(
+        enabled=bool(_get(raw, "stablecoin", "enabled", False)),
+        source_url=str(_get(
+            raw, "stablecoin", "source_url",
+            "https://api.exchange.coinbase.com")),
+        refresh_seconds=_positive(_get(
+            raw, "stablecoin", "refresh_seconds", 30.0),
+            "stablecoin.refresh_seconds"),
+        max_age_seconds=_positive(_get(
+            raw, "stablecoin", "max_age_seconds", 90.0),
+            "stablecoin.max_age_seconds"),
+        warning_deviation_bps=_nonnegative(_get(
+            raw, "stablecoin", "warning_deviation_bps", 10.0),
+            "stablecoin.warning_deviation_bps"),
+        halt_deviation_bps=_positive(_get(
+            raw, "stablecoin", "halt_deviation_bps", 30.0),
+            "stablecoin.halt_deviation_bps"),
+    )
+    if stablecoin.warning_deviation_bps > stablecoin.halt_deviation_bps:
+        raise ConfigError("stablecoin.warning_deviation_bps must be <= "
+                          "halt_deviation_bps")
+    if stablecoin.enabled and not stablecoin.source_url.strip():
+        raise ConfigError("stablecoin.source_url must not be empty when enabled")
+    if (funding.enabled or stablecoin.enabled) and not vwap_sizing.enabled:
+        raise ConfigError("funding/stablecoin cost modeling requires "
+                          "sizing.vwap_enabled: true")
+
+    session = SessionConfig(
+        enabled=bool(_get(raw, "session", "enabled", False)))
+
     entropy_dex = _get(raw, "entropy", "dex", "io")
     if hedge_venue == "tradexyz" and entropy_dex == "xyz":
         raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
@@ -304,6 +720,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
         cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
         orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
+        quote_asset=str(_get(raw, "entropy", "quote_asset", "USDC")).upper(),
         hl_dex=entropy_dex,
         hl_creds=entropy_hl_creds,
     )
@@ -315,6 +732,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
+            quote_asset=str(_get(raw, "hedge", "quote_asset", "USDC")).upper(),
             hl_dex="xyz",
             hl_creds=HLCreds(
                 _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
@@ -328,11 +746,16 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
+            quote_asset=str(_get(
+                raw, "hedge", "quote_asset",
+                "USDG" if hedge_venue == "lighter-rh" else "USDC")).upper(),
             lighter_profile=LIGHTER_PROFILES[hedge_venue],
             lighter_creds=LighterCreds(_env_i("LIGHTER_ACCOUNT_INDEX"),
                                        _env_i("LIGHTER_API_KEY_INDEX"),
                                        _env_s("LIGHTER_API_PRIVATE_KEY")),
         )
+    if not entropy.quote_asset.strip() or not hedge.quote_asset.strip():
+        raise ConfigError("venue quote_asset must not be empty")
 
     return Config(
         symbol=symbol,
@@ -366,4 +789,14 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
+        midline=midline,
+        regime=regime,
+        market_data=market_data,
+        vwap_sizing=vwap_sizing,
+        execution_risk=execution_risk,
+        kill_switch=kill_switch,
+        accounting=accounting,
+        funding=funding,
+        stablecoin=stablecoin,
+        session=session,
     )
