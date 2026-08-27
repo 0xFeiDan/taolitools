@@ -188,9 +188,11 @@ class FundingConfig:
 @dataclass(frozen=True)
 class StablecoinConfig:
     enabled: bool
+    provider: str
     source_url: str
     refresh_seconds: float
     max_age_seconds: float
+    max_spread_bps: float
     warning_deviation_bps: float
     halt_deviation_bps: float
 
@@ -393,9 +395,11 @@ _SCHEMA: Dict[str, Any] = {
     },
     "stablecoin": {
         "enabled": bool,
+        "provider": str,
         "source_url": str,
         "refresh_seconds": float,
         "max_age_seconds": float,
+        "max_spread_bps": float,
         "warning_deviation_bps": float,
         "halt_deviation_bps": float,
     },
@@ -790,15 +794,20 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     )
     stablecoin = StablecoinConfig(
         enabled=bool(_get(raw, "stablecoin", "enabled", False)),
+        provider=str(_get(
+            raw, "stablecoin", "provider", "kraken")).strip().lower(),
         source_url=str(_get(
             raw, "stablecoin", "source_url",
-            "https://api.exchange.coinbase.com")),
+            "https://api.kraken.com")).strip().rstrip("/"),
         refresh_seconds=_positive(_get(
             raw, "stablecoin", "refresh_seconds", 30.0),
             "stablecoin.refresh_seconds"),
         max_age_seconds=_positive(_get(
             raw, "stablecoin", "max_age_seconds", 90.0),
             "stablecoin.max_age_seconds"),
+        max_spread_bps=_positive(_get(
+            raw, "stablecoin", "max_spread_bps", 10.0),
+            "stablecoin.max_spread_bps"),
         warning_deviation_bps=_nonnegative(_get(
             raw, "stablecoin", "warning_deviation_bps", 10.0),
             "stablecoin.warning_deviation_bps"),
@@ -811,6 +820,12 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                           "halt_deviation_bps")
     if stablecoin.enabled and not stablecoin.source_url.strip():
         raise ConfigError("stablecoin.source_url must not be empty when enabled")
+    if stablecoin.provider != "kraken":
+        raise ConfigError("stablecoin.provider must be 'kraken'")
+    if (stablecoin.enabled
+            and stablecoin.source_url != "https://api.kraken.com"):
+        raise ConfigError("stablecoin.source_url must be "
+                          "https://api.kraken.com for provider 'kraken'")
     if (funding.enabled or stablecoin.enabled) and not vwap_sizing.enabled:
         raise ConfigError("funding/stablecoin cost modeling requires "
                           "sizing.vwap_enabled: true")
@@ -831,6 +846,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         (stablecoin.max_age_seconds, "stablecoin.max_age_seconds"),
     ):
         _at_most(value, MAX_CONFIG_SECONDS, path)
+    _at_most(stablecoin.max_spread_bps, MAX_CONFIG_BPS,
+             "stablecoin.max_spread_bps")
     for value, path in (
         (execution_risk.max_unhedged_delta_usd,
          "execution.max_unhedged_delta_usd"),

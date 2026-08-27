@@ -29,7 +29,8 @@ class CostMonitor:
                  expected_holding_hours: float, funding_max_age_seconds: float,
                  stablecoin_enabled: bool, stablecoin_max_age_seconds: float,
                  warning_deviation_bps: float, halt_deviation_bps: float,
-                 quote_assets: Dict[str, str]) -> None:
+                 quote_assets: Dict[str, str],
+                 stablecoin_max_spread_bps: float = 10.0) -> None:
         self.funding_enabled = funding_enabled
         self.expected_holding_hours = expected_holding_hours
         self.funding_max_age_seconds = funding_max_age_seconds
@@ -37,6 +38,7 @@ class CostMonitor:
         self.stablecoin_max_age_seconds = stablecoin_max_age_seconds
         self.warning_deviation_bps = warning_deviation_bps
         self.halt_deviation_bps = halt_deviation_bps
+        self.stablecoin_max_spread_bps = stablecoin_max_spread_bps
         self.quote_assets = {k: v.upper() for k, v in quote_assets.items()}
         self.funding_rates: Dict[str, RateObservation] = {}
         self.quote_usd: Dict[str, RateObservation] = {
@@ -158,23 +160,76 @@ class CostMonitor:
 
     async def refresh_stablecoins(self, session: aiohttp.ClientSession,
                                   source_url: str) -> None:
-        assets = set(self.quote_assets.values()) - {"USD"}
+        """Refresh Kraken ``ASSET/USD`` books as one atomic observation set.
+
+        Kraken's level timestamps are used instead of request completion time:
+        an HTTP connection can remain healthy while a thin book stops changing.
+        If any required asset is invalid, stale, crossed, or too wide, none of
+        the rates are advanced and the existing max-age guard fails closed.
+        """
+        assets = sorted(set(self.quote_assets.values()) - {"USD"})
+        if not assets:
+            return
         now = time.time()
+        pending: Dict[str, RateObservation] = {}
         for asset in assets:
-            url = source_url.rstrip("/") + f"/products/{asset}-USD/book"
+            pair = f"{asset}USD"
+            url = source_url.rstrip("/") + "/0/public/Depth"
             try:
                 async with session.get(
-                        url, params={"level": "1"},
+                        url, params={"pair": pair, "count": "1"},
                         timeout=aiohttp.ClientTimeout(total=10.0)) as response:
                     response.raise_for_status()
                     data = await response.json()
-                bid = float((data.get("bids") or [])[0][0])
-                ask = float((data.get("asks") or [])[0][0])
-                if bid > 0 and ask > 0:
-                    self.set_quote_usd(asset, (bid + ask) / 2.0,
-                                       observed_at=now, source=source_url)
+                if not isinstance(data, dict):
+                    raise ValueError("Kraken response must be an object")
+                errors = data.get("error")
+                result = data.get("result")
+                if not isinstance(errors, list) or errors:
+                    raise ValueError("Kraken returned an API error")
+                if not isinstance(result, dict) or set(result) != {pair}:
+                    raise ValueError("Kraken returned the wrong asset pair")
+                book = result[pair]
+                if not isinstance(book, dict):
+                    raise ValueError("Kraken book must be an object")
+                bid, bid_qty, bid_at = self._kraken_level(book.get("bids"))
+                ask, ask_qty, ask_at = self._kraken_level(book.get("asks"))
+                if bid > ask:
+                    raise ValueError("Kraken book is crossed")
+                spread_bps = (ask / bid - 1.0) * 1e4
+                if (not math.isfinite(spread_bps)
+                        or spread_bps > self.stablecoin_max_spread_bps):
+                    raise ValueError("Kraken book spread is too wide")
+                observed_at = min(bid_at, ask_at)
+                if (observed_at < now - self.stablecoin_max_age_seconds
+                        or observed_at > now + 5.0):
+                    raise ValueError("Kraken book timestamp is not current")
+                # Quantities are deliberately validated even though this
+                # monitor consumes only the midpoint. Empty/dummy levels must
+                # never become a trusted risk conversion rate.
+                if bid_qty <= 0 or ask_qty <= 0:
+                    raise ValueError("Kraken book quantity must be positive")
+                pending[asset] = RateObservation(
+                    (bid + ask) / 2.0, observed_at,
+                    f"{url}?pair={pair}&count=1")
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError,
                     TypeError, IndexError, KeyError):
                 # Keep the prior timestamp. It will naturally become stale and
                 # fail closed if the source remains unavailable.
-                continue
+                return
+        self.quote_usd.update(pending)
+
+    @staticmethod
+    def _kraken_level(levels: object) -> tuple[float, float, float]:
+        if not isinstance(levels, list) or len(levels) != 1:
+            raise ValueError("Kraken level-1 book must contain one level")
+        level = levels[0]
+        if not isinstance(level, (list, tuple)) or len(level) < 3:
+            raise ValueError("Kraken book level is malformed")
+        price, quantity, observed_at = map(float, level[:3])
+        if not all(math.isfinite(value)
+                   for value in (price, quantity, observed_at)):
+            raise ValueError("Kraken book level must be finite")
+        if price <= 0 or quantity <= 0 or observed_at <= 0:
+            raise ValueError("Kraken book level must be positive")
+        return price, quantity, observed_at

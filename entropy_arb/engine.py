@@ -142,7 +142,8 @@ class Engine:
             warning_deviation_bps=cfg.stablecoin.warning_deviation_bps,
             halt_deviation_bps=cfg.stablecoin.halt_deviation_bps,
             quote_assets={"entropy": cfg.entropy.quote_asset,
-                          "hedge": cfg.hedge.quote_asset})
+                          "hedge": cfg.hedge.quote_asset},
+            stablecoin_max_spread_bps=cfg.stablecoin.max_spread_bps)
         self.ledger = (PairLedger(cfg.accounting.ledger_jsonl,
                                   cfg.accounting.state_json)
                        if cfg.accounting.enabled else None)

@@ -190,6 +190,8 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `accounting.enabled` | 持久化 Pair 台账与重启快照 | `true`（示例配置） |
 | `funding.enabled` / `expected_holding_hours` | 双所实时资金费成本 | 示例为 `true` / 1 小时 |
 | `stablecoin.enabled` | 各交易所计价资产换算 USD 并监控脱锚 | `true`（示例配置） |
+| `stablecoin.provider` / `source_url` | 公共一档盘口来源 | `kraken` / `https://api.kraken.com` |
+| `stablecoin.max_spread_bps` | 换算盘口允许的最大买卖价差 | `10` |
 | `execution.*` | 滑点保护、超时、对账周期等 | 见配置文件 |
 | `market_data.enforce_book_age` | 是否启用毫秒级盘口年龄拒单 | `true`（示例配置） |
 | `market_data.max_book_age_ms` | 任一盘口超过该年龄则禁止新增交易 | `300` |
@@ -329,13 +331,23 @@ VWAP 最小/最大订单、两边仓位上限、净 Delta、对账差异、成�
 MTM PnL 使用同一套实时 quote→USD 汇率；各 venue 的 `cash` 仍保留原始计价币，
 只在跨 venue 汇总时换算，避免把 USDG、USDC 数字直接相加。
 
-示例配置从 Coinbase Exchange 的 `ASSET-USD` 一档盘口读取价格。来源缺失或过期会
-禁止 OPEN/ADD；超过 `halt_deviation_bps` 也会暂停新增风险。必须正确设置每条腿的
+示例配置从 Kraken 公共 REST API 的 `ASSET/USD` 一档盘口读取价格，其中 USDG 是
+Lighter Robinhood 使用的 Paxos USDG。Bitget 的 USDGO 是 Anchorage Digital/OSL
+发行的另一种资产，禁止用它替代 USDG。只有全部所需盘口均为有限正数、未交叉、
+时间新鲜且买卖价差不超过 `max_spread_bps` 时才整批更新；否则保留旧时间戳并最终
+因过期失败关闭。来源缺失或过期会禁止 OPEN/ADD；超过 `halt_deviation_bps` 也会暂停新增风险。必须正确设置每条腿的
 `quote_asset`；默认 Entropy/Lighter 主网/trade.xyz 为 USDC，Lighter Robinhood
 为 USDG。有效中枢门槛也会按当前方向（反向使用精确倒数）换算到同一 USD 比率，
 避免 USDG/USDC 基差只移动可执行 edge 却不移动门槛。非 USD 计价资产在实盘模式
 必须启用且取得新鲜的 stablecoin 换算数据，否则拒绝启动；换算过期后，账户变化和
 会话 PnL 显示为未知，不会继续把旧的 USDG/USDC 汇率冒充实时 USD 估值。
+
+参考 USDG/USDC 报价基差由两者各自的真实美元中间价计算；执行成本字段会根据
+买卖方向使用相应正负号：
+
+```text
+USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10,000
+```
 
 ## 密钥配置（`.env`，仅实盘需要）
 

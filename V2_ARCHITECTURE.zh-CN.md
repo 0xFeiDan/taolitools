@@ -586,15 +586,24 @@ hedge:
 
 stablecoin:
   enabled: true
-  source_url: https://api.exchange.coinbase.com
+  provider: kraken
+  source_url: https://api.kraken.com
   refresh_seconds: 30
   max_age_seconds: 90
+  max_spread_bps: 10
   warning_deviation_bps: 10
   halt_deviation_bps: 30
 ```
 
-系统读取 `ASSET-USD` 一档盘口中间价，将每条腿独立换算成 USD。Stablecoin Basis
-不是简单塞进 Dynamic Midline，而是作为独立成本和风险输入。
+系统读取 Kraken `ASSET/USD` 一档盘口中间价，将每条腿独立换算成 USD。USDG
+指 Lighter Robinhood 使用的 Paxos USDG；Bitget USDGO 是不同资产，不得替代。
+盘口必须有限、为正、未交叉、未过期且 spread 不超过 `max_spread_bps`，并且全部
+所需资产验证成功后才原子更新。Stablecoin Basis 不是简单塞进 Dynamic Midline，
+而是作为独立成本和风险输入。下式是参考报价基差，执行成本字段会按买卖方向取符号：
+
+```text
+USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10000
+```
 
 状态：
 
@@ -1044,7 +1053,9 @@ P50 / P95 / P99 / max
 | `funding.refresh_seconds` | 当前费率刷新周期 |
 | `funding.max_age_seconds` | Funding 最大数据年龄 |
 | `stablecoin.enabled` | 启用 quote/USD 换算和脱锚保护 |
+| `stablecoin.provider` | 行情适配器；当前必须为 `kraken` |
 | `stablecoin.source_url` | 独立现货价格源 |
+| `stablecoin.max_spread_bps` | 换算盘口最大允许 spread |
 | `stablecoin.warning_deviation_bps` | 告警阈值 |
 | `stablecoin.halt_deviation_bps` | 暂停新增阈值 |
 | `accounting.enabled` | Pair PnL 和重启恢复开关 |
@@ -1337,5 +1348,5 @@ Dynamic Midline
 - Hyperliquid Funding：<https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding>
 - Lighter Python SDK：<https://github.com/elliottech/lighter-python>
 - Lighter Funding：<https://docs.lighter.xyz/trading/funding>
-- Coinbase Exchange Product Book：<https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-book>
+- Kraken REST Order Book：<https://docs.kraken.com/api/docs/rest-api/get-order-book/>
 - NYSE Holidays & Trading Hours：<https://www.nyse.com/trade/hours-calendars>

@@ -203,6 +203,8 @@ errors), credentials in `.env`, and the markets on the command line
 | `accounting.enabled` | durable Pair ledger and restart snapshot | `true` in the example |
 | `funding.enabled` / `expected_holding_hours` | live two-venue funding cost | `true` / 1h in the example |
 | `stablecoin.enabled` | normalize each venue quote asset to USD and halt on depeg | `true` in the example |
+| `stablecoin.provider` / `source_url` | public level-1 quote source | `kraken` / `https://api.kraken.com` |
+| `stablecoin.max_spread_bps` | reject an illiquid/wide conversion book | `10` |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
 | `market_data.enforce_book_age` | enable millisecond book-age rejection | `true` in the example |
 | `market_data.max_book_age_ms` | reject new trades if either book is older | `300` |
@@ -363,8 +365,13 @@ adjusted gross edge
   - buy VWAP  × buy quote/USD
 ```
 
-The example reads level-1 `ASSET-USD` books from Coinbase Exchange. A missing or
-stale source blocks OPEN/ADD. `warning_deviation_bps` is observable; crossing
+The example reads level-1 `ASSET/USD` books from Kraken's public REST API,
+including the actual Paxos USDG used by Lighter Robinhood. Bitget's similarly
+named USDGO is a different Anchorage Digital/OSL asset and must not be used as
+a proxy. Rates are committed only when every required book has a finite,
+positive, non-crossed, current level with spread at or below
+`max_spread_bps`; otherwise prior timestamps are retained and become stale.
+A missing or stale source blocks OPEN/ADD. `warning_deviation_bps` is observable; crossing
 `halt_deviation_bps` pauses new exposure. Set each venue's `quote_asset`
 correctly; the defaults are USDC for Entropy/Lighter mainnet/trade.xyz and USDG
 for Lighter Robinhood. The active midline hurdle is converted into the same
@@ -373,6 +380,13 @@ basis cannot move the executable edge without moving its hurdle. Live mode
 refuses non-USD quote assets unless fresh stablecoin conversion is enabled.
 Account/session PnL is reported as unavailable once that conversion is stale;
 an old USDG/USDC rate is never presented as current USD value.
+
+The reference USDG/USDC quote basis is derived from the two real USD rates
+(the execution cost field applies a direction-dependent sign):
+
+```text
+USDG/USDC basis bps = (USDG_USD / USDC_USD - 1) * 10,000
+```
 
 ## Credentials (`.env`, live only)
 

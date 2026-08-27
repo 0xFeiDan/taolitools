@@ -56,6 +56,9 @@ def test_example_config_loads():
     assert cfg.accounting.enabled is True
     assert cfg.funding.enabled is True
     assert cfg.stablecoin.enabled is True
+    assert cfg.stablecoin.provider == "kraken"
+    assert cfg.stablecoin.source_url == "https://api.kraken.com"
+    assert cfg.stablecoin.max_spread_bps == 10.0
     assert cfg.entropy.quote_asset == "USDC"
     assert cfg.hedge.quote_asset == "USDG"
     assert cfg.premium_persist_sec == 0.3
@@ -281,6 +284,16 @@ def test_v2_validation():
     expect_error(MINIMAL + "\nsizing:\n  vwap_enabled: true\n"
                  "stablecoin:\n  enabled: true\n  source_url: ''\n",
                  "source_url")
+    expect_error(MINIMAL + "\nsizing:\n  vwap_enabled: true\n"
+                 "stablecoin:\n  enabled: true\n  provider: coinbase\n",
+                 "provider")
+    expect_error(MINIMAL + "\nsizing:\n  vwap_enabled: true\n"
+                 "stablecoin:\n  enabled: true\n"
+                 "  source_url: https://api.exchange.coinbase.com\n",
+                 "api.kraken.com")
+    expect_error(MINIMAL + "\nsizing:\n  vwap_enabled: true\n"
+                 "stablecoin:\n  enabled: true\n  max_spread_bps: .nan\n",
+                 "finite")
     expect_error(MINIMAL + "\nentropy:\n  quote_asset: ''\n",
                  "quote_asset")
 

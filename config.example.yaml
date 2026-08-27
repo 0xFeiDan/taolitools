@@ -195,14 +195,18 @@ funding:
   refresh_seconds: 60
   max_age_seconds: 180
 
-# Quote assets are normalized to USD with Coinbase Exchange level-1 books.
-# A missing source fails closed; a severe depeg pauses OPEN/ADD.
-# 使用 Coinbase Exchange 一档盘口将计价资产换算为 USD；数据缺失或严重脱锚会暂停开仓。
+# Quote assets are normalized with Kraken ASSET/USD level-1 books. Kraken has
+# the actual Paxos USDG used by Lighter RH; Bitget's USDGO is a different asset.
+# A missing/stale/crossed/wide book fails closed; a severe depeg pauses OPEN/ADD.
+# 使用 Kraken 的 ASSET/USD 一档盘口换算；Kraken 的 USDG 才是 Lighter RH 使用的
+# Paxos USDG，Bitget 的 USDGO 是另一种资产。缺失、过期、交叉或过宽盘口均失败关闭。
 stablecoin:
   enabled: true
-  source_url: https://api.exchange.coinbase.com
+  provider: kraken
+  source_url: https://api.kraken.com
   refresh_seconds: 30
   max_age_seconds: 90
+  max_spread_bps: 10
   warning_deviation_bps: 10
   halt_deviation_bps: 30
 
