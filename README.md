@@ -172,6 +172,11 @@ Once per second it samples both live books; once per minute it writes a row:
 | `hedge_entropy_quote_basis_close_bps` | hedge quote / Entropy quote basis; USDG/USDC for Lighter RH |
 | `premium_usd_*_bps` | mid premium after both legs are converted to USD |
 | `sell_edge_usd_*_bps`, `buy_edge_usd_*_bps` | executable directional edges in USD |
+| `*_usd_min/p50/p95/p99_bps` | distribution of one-second samples instead of only one spike |
+| `*_usd_ge_10_samples` | samples at or above the 10 bps observation line |
+| `*_usd_longest_ge_10_samples/span_seconds` | longest consecutive run at or above 10 bps; a gap over 2.5 seconds breaks the run |
+| `*_usd_max_time_utc`, `*_usd_max_*` | exact UTC time and both legs/FX BBO at the maximum |
+| `book_update_skew_ms_p95/max` | timestamp skew between venue books, useful for rejecting asynchronous quotes |
 | `fx_samples` | subset of book samples with fresh quote/USD rates |
 
 Raw fields are retained even when FX is missing, but USD fields remain blank
@@ -184,6 +189,11 @@ the USD fields and subtracts `--fees-bps` (pass the
 suggestions translate directly into config values. `--hours 24` restricts to
 recent data; premiums drift, so re-run it regularly and update
 `config.yaml`.
+The 10 bps line is an observation threshold, not guaranteed profit. A basic
+candidate should have at least four consecutive samples spanning three seconds
+before depth and latency checks.
+Run `python3 tools/opportunities.py --csv logs/minutes.csv --hours 24` to list
+only those candidates.
 
 ## Configuration
 
@@ -215,7 +225,7 @@ errors), credentials in `.env`, and the markets on the command line
 | `sizing.max_vwap_slippage_bps` / `max_book_impact_bps` | reject sizes that consume too much depth | 5 / 5 |
 | `sizing.safety_buffer_bps` / `expected_latency_cost_bps` | explicit deductions beyond fees and visible depth | 2 / 0 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
-| `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
+| `execution.premium_persist_sec` | edge must persist before firing | 3.0 |
 | `execution.risk_recovery_enabled` / `hedge_timeout_ms` | one-leg timeout recovery | `true` / 250ms in the example |
 | `execution.max_unhedged_delta_usd` | delta threshold for emergency hedging | 100 in the example |
 | `kill_switch.enabled` | unified risk-event and persistent entry-pause handling | `true` in the example |

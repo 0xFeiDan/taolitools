@@ -26,7 +26,11 @@ zero; missing FX is never represented as parity.
 Bid/ask columns are the minute's last fresh sample (close). A row is only
 written for minutes with at least one sample where both books were fresh;
 `samples` says how many of the ~60 seconds qualified; ``fx_samples`` counts
-the subset that also had fresh quote/USD observations.
+the subset that also had fresh quote/USD observations. The USD opportunity
+columns retain distribution percentiles, the exact maximum sample, and the
+longest consecutive run at or above 10 bps. Samples more than 2.5 seconds
+apart never count as one run. These are observation fields, not a promise that
+the displayed size was fillable.
 """
 from __future__ import annotations
 
@@ -42,6 +46,9 @@ from typing import Callable, Optional
 from .book import OrderBook
 
 log = logging.getLogger("recorder")
+
+OPPORTUNITY_THRESHOLD_BPS = 10.0
+OPPORTUNITY_MAX_SAMPLE_GAP_SECONDS = 2.5
 
 HEADER = ["minute_ts", "time_utc",
           "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
@@ -59,7 +66,28 @@ HEADER = ["minute_ts", "time_utc",
           "premium_usd_low_bps", "premium_usd_close_bps",
           "premium_usd_mean_bps", "premium_usd_std_bps",
           "sell_edge_usd_mean_bps", "sell_edge_usd_max_bps",
-          "buy_edge_usd_mean_bps", "buy_edge_usd_max_bps", "fx_samples"]
+          "buy_edge_usd_mean_bps", "buy_edge_usd_max_bps",
+          "opportunity_threshold_bps",
+          "sell_edge_usd_min_bps", "sell_edge_usd_p50_bps",
+          "sell_edge_usd_p95_bps", "sell_edge_usd_p99_bps",
+          "sell_edge_usd_ge_10_samples",
+          "sell_edge_usd_longest_ge_10_samples",
+          "sell_edge_usd_longest_ge_10_span_seconds",
+          "sell_edge_usd_max_time_utc",
+          "sell_edge_usd_max_entropy_bid",
+          "sell_edge_usd_max_hedge_ask",
+          "sell_edge_usd_max_fx_ask",
+          "buy_edge_usd_min_bps", "buy_edge_usd_p50_bps",
+          "buy_edge_usd_p95_bps", "buy_edge_usd_p99_bps",
+          "buy_edge_usd_ge_10_samples",
+          "buy_edge_usd_longest_ge_10_samples",
+          "buy_edge_usd_longest_ge_10_span_seconds",
+          "buy_edge_usd_max_time_utc",
+          "buy_edge_usd_max_entropy_ask",
+          "buy_edge_usd_max_hedge_bid",
+          "buy_edge_usd_max_fx_bid",
+          "book_update_skew_ms_p95", "book_update_skew_ms_max",
+          "fx_samples"]
 
 
 class _MinuteAgg:
@@ -70,7 +98,14 @@ class _MinuteAgg:
                  "fx_p_low", "fx_p_close", "fx_p_sum", "fx_p_sumsq",
                  "fx_s_sum", "fx_s_max", "fx_b_sum", "fx_b_max",
                  "e_rate", "h_rate", "pair_bid", "pair_ask",
-                 "pair_spread", "quote_basis")
+                 "pair_spread", "quote_basis", "fx_s_values",
+                 "fx_b_values", "book_skews_ms", "last_fx_ts",
+                 "s_hits", "s_streak", "s_streak_start", "s_longest",
+                 "s_longest_span", "b_hits", "b_streak",
+                 "b_streak_start", "b_longest", "b_longest_span",
+                 "s_max_ts", "s_max_e_bid", "s_max_h_ask",
+                 "s_max_fx_ask", "b_max_ts", "b_max_e_ask",
+                 "b_max_h_bid", "b_max_fx_bid")
 
     def __init__(self, minute: int, entropy_asset: str,
                  hedge_asset: str) -> None:
@@ -95,12 +130,26 @@ class _MinuteAgg:
         self.e_rate = self.h_rate = 0.0
         self.pair_bid = self.pair_ask = self.pair_spread = 0.0
         self.quote_basis = 0.0
+        self.fx_s_values = []
+        self.fx_b_values = []
+        self.book_skews_ms = []
+        self.last_fx_ts = None
+        self.s_hits = self.s_streak = self.s_longest = 0
+        self.b_hits = self.b_streak = self.b_longest = 0
+        self.s_streak_start = self.b_streak_start = None
+        self.s_longest_span = self.b_longest_span = 0.0
+        self.s_max_ts = self.b_max_ts = None
+        self.s_max_e_bid = self.s_max_h_ask = self.s_max_fx_ask = 0.0
+        self.b_max_e_ask = self.b_max_h_bid = self.b_max_fx_bid = 0.0
 
     def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float,
             e_rate: Optional[float] = None,
             h_rate: Optional[float] = None,
             pair_bid: Optional[float] = None,
-            pair_ask: Optional[float] = None) -> None:
+            pair_ask: Optional[float] = None, *,
+            sample_ts: Optional[float] = None,
+            book_skew_ms: Optional[float] = None) -> None:
+        sample_ts = time.time() if sample_ts is None else float(sample_ts)
         e_mid = (e_bid + e_ask) / 2.0
         h_mid = (h_bid + h_ask) / 2.0
         prem = (e_mid / h_mid - 1.0) * 1e4
@@ -143,8 +192,12 @@ class _MinuteAgg:
         fx_buy = (h_bid * pair_bid / e_ask - 1.0) * 1e4
         quote_basis = (pair_mid - 1.0) * 1e4
         if not all(math.isfinite(value) for value in (
-                fx_prem, fx_sell, fx_buy, pair_spread, quote_basis)):
+                sample_ts, fx_prem, fx_sell, fx_buy, pair_spread,
+                quote_basis)):
             return
+        if (book_skew_ms is not None and math.isfinite(float(book_skew_ms))
+                and float(book_skew_ms) >= 0):
+            self.book_skews_ms.append(float(book_skew_ms))
         if self.fx_n == 0:
             self.fx_p_open = self.fx_p_high = self.fx_p_low = fx_prem
         self.fx_n += 1
@@ -154,13 +207,83 @@ class _MinuteAgg:
         self.fx_p_sum += fx_prem
         self.fx_p_sumsq += fx_prem * fx_prem
         self.fx_s_sum += fx_sell
+        if fx_sell > self.fx_s_max:
+            self.s_max_ts = sample_ts
+            self.s_max_e_bid = e_bid
+            self.s_max_h_ask = h_ask
+            self.s_max_fx_ask = pair_ask
         self.fx_s_max = max(self.fx_s_max, fx_sell)
         self.fx_b_sum += fx_buy
+        if fx_buy > self.fx_b_max:
+            self.b_max_ts = sample_ts
+            self.b_max_e_ask = e_ask
+            self.b_max_h_bid = h_bid
+            self.b_max_fx_bid = pair_bid
         self.fx_b_max = max(self.fx_b_max, fx_buy)
+        self.fx_s_values.append(fx_sell)
+        self.fx_b_values.append(fx_buy)
+        self._update_streaks(sample_ts, fx_sell, fx_buy)
         self.e_rate, self.h_rate = e_rate, h_rate
         self.pair_bid, self.pair_ask = pair_bid, pair_ask
         self.pair_spread = pair_spread
         self.quote_basis = quote_basis
+
+    def _update_streaks(self, sample_ts: float, sell_edge: float,
+                        buy_edge: float) -> None:
+        if (self.last_fx_ts is not None
+                and sample_ts - self.last_fx_ts
+                > OPPORTUNITY_MAX_SAMPLE_GAP_SECONDS):
+            self.s_streak = self.b_streak = 0
+            self.s_streak_start = self.b_streak_start = None
+        self.last_fx_ts = sample_ts
+
+        if sell_edge >= OPPORTUNITY_THRESHOLD_BPS:
+            self.s_hits += 1
+            if self.s_streak == 0:
+                self.s_streak_start = sample_ts
+            self.s_streak += 1
+            span = sample_ts - self.s_streak_start
+            if (self.s_streak > self.s_longest
+                    or (self.s_streak == self.s_longest
+                        and span > self.s_longest_span)):
+                self.s_longest = self.s_streak
+                self.s_longest_span = span
+        else:
+            self.s_streak = 0
+            self.s_streak_start = None
+
+        if buy_edge >= OPPORTUNITY_THRESHOLD_BPS:
+            self.b_hits += 1
+            if self.b_streak == 0:
+                self.b_streak_start = sample_ts
+            self.b_streak += 1
+            span = sample_ts - self.b_streak_start
+            if (self.b_streak > self.b_longest
+                    or (self.b_streak == self.b_longest
+                        and span > self.b_longest_span)):
+                self.b_longest = self.b_streak
+                self.b_longest_span = span
+        else:
+            self.b_streak = 0
+            self.b_streak_start = None
+
+    @staticmethod
+    def _percentile(values: list[float], quantile: float) -> float:
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * quantile
+        low = math.floor(position)
+        high = math.ceil(position)
+        if low == high:
+            return ordered[low]
+        return (ordered[low] * (high - position)
+                + ordered[high] * (position - low))
+
+    @staticmethod
+    def _utc(timestamp: Optional[float]) -> str:
+        if timestamp is None:
+            return ""
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(
+            timespec="milliseconds").replace("+00:00", "Z")
 
     def row(self) -> list:
         mean = self.p_sum / self.n
@@ -178,9 +301,20 @@ class _MinuteAgg:
                 f"{self.b_sum / self.n:.3f}", f"{self.b_max:.3f}",
                 self.n]
         if self.fx_n == 0:
-            return raw + [self.entropy_asset, self.hedge_asset] + [""] * 16 + [0]
+            blank_count = len(HEADER) - len(raw) - 2 - 1
+            return (raw + [self.entropy_asset, self.hedge_asset]
+                    + [""] * blank_count + [0])
         fx_mean = self.fx_p_sum / self.fx_n
         fx_var = max(self.fx_p_sumsq / self.fx_n - fx_mean * fx_mean, 0.0)
+        sell_p50 = self._percentile(self.fx_s_values, 0.50)
+        sell_p95 = self._percentile(self.fx_s_values, 0.95)
+        sell_p99 = self._percentile(self.fx_s_values, 0.99)
+        buy_p50 = self._percentile(self.fx_b_values, 0.50)
+        buy_p95 = self._percentile(self.fx_b_values, 0.95)
+        buy_p99 = self._percentile(self.fx_b_values, 0.99)
+        skew_p95 = (self._percentile(self.book_skews_ms, 0.95)
+                    if self.book_skews_ms else None)
+        skew_max = max(self.book_skews_ms) if self.book_skews_ms else None
         return raw + [
             self.entropy_asset, self.hedge_asset,
             f"{self.e_rate:.10g}", f"{self.h_rate:.10g}",
@@ -192,12 +326,26 @@ class _MinuteAgg:
             f"{fx_mean:.3f}", f"{math.sqrt(fx_var):.3f}",
             f"{self.fx_s_sum / self.fx_n:.3f}", f"{self.fx_s_max:.3f}",
             f"{self.fx_b_sum / self.fx_n:.3f}", f"{self.fx_b_max:.3f}",
+            f"{OPPORTUNITY_THRESHOLD_BPS:.3f}",
+            f"{min(self.fx_s_values):.3f}", f"{sell_p50:.3f}",
+            f"{sell_p95:.3f}", f"{sell_p99:.3f}",
+            self.s_hits, self.s_longest, f"{self.s_longest_span:.3f}",
+            self._utc(self.s_max_ts), f"{self.s_max_e_bid:.10g}",
+            f"{self.s_max_h_ask:.10g}", f"{self.s_max_fx_ask:.10g}",
+            f"{min(self.fx_b_values):.3f}", f"{buy_p50:.3f}",
+            f"{buy_p95:.3f}", f"{buy_p99:.3f}",
+            self.b_hits, self.b_longest, f"{self.b_longest_span:.3f}",
+            self._utc(self.b_max_ts), f"{self.b_max_e_ask:.10g}",
+            f"{self.b_max_h_bid:.10g}", f"{self.b_max_fx_bid:.10g}",
+            "" if skew_p95 is None else f"{skew_p95:.3f}",
+            "" if skew_max is None else f"{skew_max:.3f}",
             self.fx_n]
 
 
 class MinuteRecorder:
     def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
                  staleness_sec: float, interval_sec: float = 1.0, *,
+                 max_book_age_ms: Optional[float] = None,
                  quote_rate_getter: Optional[
                      Callable[[str, float], float]] = None,
                  quote_pair_getter: Optional[
@@ -209,6 +357,7 @@ class MinuteRecorder:
         self.hedge_book = hedge_book
         self.staleness_sec = staleness_sec
         self.interval_sec = interval_sec
+        self.max_book_age_ms = max_book_age_ms
         self.quote_rate_getter = quote_rate_getter
         self.quote_pair_getter = quote_pair_getter
         self.entropy_quote_asset = entropy_quote_asset.upper()
@@ -254,8 +403,11 @@ class MinuteRecorder:
         minute = int(now // 60)
         if self._agg is not None and self._agg.minute != minute:
             self._flush_agg()
-        if not (self.entropy_book.is_fresh(self.staleness_sec)
-                and self.hedge_book.is_fresh(self.staleness_sec)):
+        entropy_quality = self.entropy_book.quality(
+            self.staleness_sec, max_book_age_ms=self.max_book_age_ms, now=now)
+        hedge_quality = self.hedge_book.quality(
+            self.staleness_sec, max_book_age_ms=self.max_book_age_ms, now=now)
+        if not (entropy_quality.ok and hedge_quality.ok):
             return
         e_bid, e_ask = self.entropy_book.best_bid(), self.entropy_book.best_ask()
         h_bid, h_ask = self.hedge_book.best_bid(), self.hedge_book.best_ask()
@@ -278,8 +430,11 @@ class MinuteRecorder:
                     self.hedge_quote_asset, self.entropy_quote_asset, now)
             except (KeyError, TypeError, ValueError):
                 pair_bid = pair_ask = None
+        book_skew_ms = abs(self.entropy_book.last_update_ts
+                           - self.hedge_book.last_update_ts) * 1000.0
         self._agg.add(e_bid, e_ask, h_bid, h_ask, e_rate, h_rate,
-                      pair_bid, pair_ask)
+                      pair_bid, pair_ask, sample_ts=now,
+                      book_skew_ms=book_skew_ms)
 
     def close(self) -> None:
         """Flush the partial minute and close the file (call on shutdown)."""

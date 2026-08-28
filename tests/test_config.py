@@ -62,7 +62,7 @@ def test_example_config_loads():
     assert cfg.threshold_price_basis == "usd"
     assert cfg.entropy.quote_asset == "USDC"
     assert cfg.hedge.quote_asset == "USDG"
-    assert cfg.premium_persist_sec == 0.3
+    assert cfg.premium_persist_sec == 3.0
     assert cfg.cooldown_sec == 1.0
     assert cfg.inventory_floor_frac == 0.5
     assert cfg.entropy.cap_usd == cfg.hedge.cap_usd == 500.0

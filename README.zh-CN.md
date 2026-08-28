@@ -161,6 +161,11 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `hedge_entropy_quote_basis_close_bps` | 对冲计价币/Entropy 计价币基差；Lighter RH 即 USDG/USDC |
 | `premium_usd_*_bps` | 两腿换算 USD 后的中间价溢价 |
 | `sell_edge_usd_*_bps`, `buy_edge_usd_*_bps` | USD 口径的两方向可执行 edge |
+| `*_usd_min/p50/p95/p99_bps` | 该分钟每秒样本的分布，避免只看一次尖峰 |
+| `*_usd_ge_10_samples` | 该分钟达到 10 bps 的样本总数 |
+| `*_usd_longest_ge_10_samples/span_seconds` | 达到 10 bps 的最长连续次数和首尾持续时间；相邻样本间隔超过 2.5 秒会断开 |
+| `*_usd_max_time_utc`、`*_usd_max_*` | 最高值的精确 UTC 时间及当时两腿、汇率盘口 |
+| `book_update_skew_ms_p95/max` | 两个平台盘口更新时间差，帮助排除不同步造成的假价差 |
 | `fx_samples` | 同时具有新鲜 quote/USD 的盘口样本数 |
 
 FX 缺失时仍保留 raw 字段，但 USD 字段留空且 `fx_samples=0`，绝不伪造 1:1。
@@ -169,6 +174,9 @@ FX 缺失时仍保留 raw 字段，但 USD 字段留空且 `fx_samples=0`，绝�
 （请传入**两边吃单费之和**——零费交易所默认 0.0，对冲腿为 `tradexyz` 时
 约为 1.0），因此其表格与建议值可直接填入配置。`--hours 24`
 可只分析最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
+10 bps 是机会观察线，不等于利润保证；初步候选至少应同时满足
+`longest_ge_10_samples >= 4`、`span_seconds >= 3`，再结合可成交深度和延迟判断。
+可直接运行：`python3 tools/opportunities.py --csv logs/minutes.csv --hours 24`。
 
 ## 配置说明
 
@@ -199,7 +207,7 @@ FX 缺失时仍保留 raw 字段，但 USD 字段留空且 `fx_samples=0`，绝�
 | `sizing.max_vwap_slippage_bps` / `max_book_impact_bps` | 仓位可接受的最大盘口滑点/冲击 | 5 / 5 |
 | `sizing.safety_buffer_bps` / `expected_latency_cost_bps` | 手续费和可见深度之外的显式扣减 | 2 / 0 |
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
-| `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
+| `execution.premium_persist_sec` | 信号需持续多久才触发 | 3.0 |
 | `execution.risk_recovery_enabled` / `hedge_timeout_ms` | 单腿超时恢复 | 示例为 `true` / 250ms |
 | `execution.max_unhedged_delta_usd` | 触发紧急对冲的净敞口阈值 | 示例为 100 |
 | `kill_switch.enabled` | 统一风险事件与持久暂停入口 | `true`（示例配置） |

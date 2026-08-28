@@ -727,8 +727,12 @@ class Engine:
                            or (cfg.entropy.quote_asset == "USD"
                                and cfg.hedge.quote_asset == "USD")
                            else None)
+            recorder_book_age_ms = (
+                cfg.market_data.max_book_age_ms
+                if cfg.market_data.enforce_book_age else None)
             self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
                                            self.hedge.book, cfg.staleness_sec,
+                                           max_book_age_ms=recorder_book_age_ms,
                                            quote_rate_getter=rate_getter,
                                            quote_pair_getter=(
                                                self.costs.fresh_quote_pair

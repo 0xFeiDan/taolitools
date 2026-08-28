@@ -7,15 +7,18 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.book import OrderBook  # noqa: E402
 from entropy_arb.recorder import HEADER, MinuteRecorder  # noqa: E402
 
 
-def set_book(book, bid, ask):
+def set_book(book, bid, ask, *, received_ts=None):
     book.apply_hl([[{"px": str(bid), "sz": "10"}],
-                   [{"px": str(ask), "sz": "10"}]])
+                   [{"px": str(ask), "sz": "10"}]],
+                  received_ts=received_ts)
 
 
 def test_minute_aggregation_and_rollover():
@@ -148,6 +151,74 @@ def test_recorder_uses_direct_cross_bid_and_ask_by_execution_direction():
     expected_buy = (99.9 * 1.0 / 100.2 - 1.0) * 1e4
     assert abs(float(row["sell_edge_usd_max_bps"]) - expected_sell) < 0.01
     assert abs(float(row["buy_edge_usd_max_bps"]) - expected_buy) < 0.01
+
+
+def test_recorder_distinguishes_sustained_opportunity_from_single_spike():
+    e_book, h_book = OrderBook(), OrderBook()
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+
+    def quote_rate(venue_key, now):
+        del venue_key, now
+        return 1.0
+
+    def quote_pair(base_asset, quote_asset, now):
+        del base_asset, quote_asset, now
+        return 1.0, 1.0
+
+    rec = MinuteRecorder(
+        path, e_book, h_book, staleness_sec=2.0,
+        max_book_age_ms=300.0,
+        quote_rate_getter=quote_rate,
+        quote_pair_getter=quote_pair,
+        entropy_quote_asset="USDC", hedge_quote_asset="USDG")
+    t0 = 1_700_000_000.0
+
+    # Three consecutive 20 bps samples, one below-threshold sample, then a
+    # single 30 bps spike after a gap. The longest qualifying run remains 3.
+    for offset in (0.0, 1.0, 2.0):
+        now = t0 + offset
+        set_book(e_book, 100.2, 100.21, received_ts=now)
+        set_book(h_book, 99.99, 100.0, received_ts=now - 0.05)
+        rec.sample(now)
+    now = t0 + 3.0
+    set_book(e_book, 99.99, 100.01, received_ts=now)
+    set_book(h_book, 99.99, 100.0, received_ts=now - 0.05)
+    rec.sample(now)
+    now = t0 + 10.0
+    set_book(e_book, 100.3, 100.31, received_ts=now)
+    set_book(h_book, 99.99, 100.0, received_ts=now - 0.05)
+    rec.sample(now)
+    rec.close()
+
+    with open(path, newline="") as fh:
+        row = next(csv.DictReader(fh))
+    assert float(row["opportunity_threshold_bps"]) == 10.0
+    assert int(row["sell_edge_usd_ge_10_samples"]) == 4
+    assert int(row["sell_edge_usd_longest_ge_10_samples"]) == 3
+    assert float(row["sell_edge_usd_longest_ge_10_span_seconds"]) == 2.0
+    assert row["sell_edge_usd_max_time_utc"] == "2023-11-14T22:13:30.000Z"
+    assert float(row["sell_edge_usd_max_entropy_bid"]) == 100.3
+    assert float(row["sell_edge_usd_max_hedge_ask"]) == 100.0
+    assert float(row["sell_edge_usd_max_fx_ask"]) == 1.0
+    assert float(row["sell_edge_usd_p50_bps"]) == pytest.approx(20.0)
+    assert float(row["book_update_skew_ms_max"]) == pytest.approx(50.0)
+
+
+def test_recorder_excludes_books_older_than_market_data_limit():
+    e_book, h_book = OrderBook(), OrderBook()
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+    now = 1_700_000_000.0
+    set_book(e_book, 100.2, 100.21, received_ts=now)
+    set_book(h_book, 99.99, 100.0, received_ts=now - 1.0)
+    rec = MinuteRecorder(
+        path, e_book, h_book, staleness_sec=2.0,
+        max_book_age_ms=300.0)
+
+    rec.sample(now)
+    rec.close()
+
+    assert rec.rows_written == 0
+    assert not os.path.exists(path)
 
 
 def test_recorder_keeps_raw_sample_but_never_fakes_missing_fx_as_parity():

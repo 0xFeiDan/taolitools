@@ -595,7 +595,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("'inventory.floor_frac' must be <= 1")
 
     premium_persist_sec = _nonnegative(
-        _get(raw, "execution", "premium_persist_sec", 0.3),
+        _get(raw, "execution", "premium_persist_sec", 3.0),
         "execution.premium_persist_sec")
     cooldown_sec = _nonnegative(
         _get(raw, "execution", "cooldown_sec", 0.0),
